@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: e2b-speedlab-android-${{ github.ref }}
+  group: e2b-speedlab-android-v2-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -68,9 +68,6 @@ jobs:
           mkdir -p /tmp/litert-lm-wheel
           unzip -q /tmp/litert-lm-api-android-arm64.whl -d /tmp/litert-lm-wheel
 
-          echo "Native files in official wheel:"
-          find /tmp/litert-lm-wheel -type f -name '*.so' -print -exec ls -lh {} \;
-
           DEST="$GITHUB_WORKSPACE/app/src/main/jniLibs/arm64-v8a"
           mkdir -p "$DEST"
 
@@ -78,8 +75,6 @@ jobs:
           test -n "$CORE_SO"
           cp "$CORE_SO" "$DEST/liblitert-lm.so"
 
-          # Copy native dependencies shipped in the same official Android wheel, but never replace
-          # LiteRT-LM's Maven JNI bridge. Extreme mode and the normal Kotlin path stay independent.
           while IFS= read -r SO; do
             NAME="$(basename "$SO")"
             case "$NAME" in
@@ -88,15 +83,8 @@ jobs:
             cp -f "$SO" "$DEST/$NAME"
           done < <(find /tmp/litert-lm-wheel -type f -name '*.so')
 
-          echo "Packaged C API payload:"
-          ls -lh "$DEST"
-
-          # The previous APK failed exactly because these symbols were absent. Refuse to create an
-          # APK unless the dedicated C API library really exports both of them.
           readelf -Ws "$DEST/liblitert-lm.so" | grep -q 'litert_lm_engine_settings_create'
           readelf -Ws "$DEST/liblitert-lm.so" | grep -q 'litert_lm_engine_settings_set_gpu_decode_steps_per_sync'
-
-          echo "C API symbol verification passed."
 
       - name: Build debug APK
         run: gradle :app:assembleDebug --stacktrace
@@ -109,9 +97,10 @@ jobs:
 
           rm -rf /tmp/apk-native
           mkdir -p /tmp/apk-native
-          unzip -q app/build/outputs/apk/debug/app-debug.apk 'lib/arm64-v8a/liblitert-lm.so' -d /tmp/apk-native
+          unzip -q app/build/outputs/apk/debug/app-debug.apk 'lib/arm64-v8a/liblitert-lm.so' 'lib/arm64-v8a/libe2b_extreme.so' -d /tmp/apk-native
           readelf -Ws /tmp/apk-native/lib/arm64-v8a/liblitert-lm.so | grep -q 'litert_lm_engine_settings_create'
           readelf -Ws /tmp/apk-native/lib/arm64-v8a/liblitert-lm.so | grep -q 'litert_lm_engine_settings_set_gpu_decode_steps_per_sync'
+          readelf -Ws /tmp/apk-native/lib/arm64-v8a/libe2b_extreme.so | grep -q 'Java_com_e2bspeedlab_ExtremeNativeLocal_nativeBenchmark'
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
