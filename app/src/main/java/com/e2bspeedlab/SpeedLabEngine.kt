@@ -13,7 +13,10 @@ import com.google.ai.edge.litertlm.SamplerConfig
 import com.google.ai.edge.litertlm.ThinkingConfig
 import java.io.Closeable
 import java.io.File
+import java.util.concurrent.Executors
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ExecutorCoroutineDispatcher
+import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.withContext
 
@@ -104,6 +107,7 @@ class SpeedLabEngine(private val cacheDirectory: File) : Closeable {
 
     private var engine: Engine? = null
     private var conversation: Conversation? = null
+    private var generationDispatcher: ExecutorCoroutineDispatcher? = null
     private var activeContextTokens: Int = MAX_CONTEXT_TOKENS
     private var activeFastestCpuCount: Int = 0
     private var activeAffinityMask: Long = 0L
@@ -151,8 +155,23 @@ class SpeedLabEngine(private val cacheDirectory: File) : Closeable {
             activeContextTokens = maxContext
             activeFastestCpuCount = fastestCpuCount
             activeAffinityMask = tunedMask
+
+            // Normal Generate gets its own single host thread when Turbo CPU affinity is active.
+            // Keeping streaming on one Java thread is important: sched_setaffinity is thread-local,
+            // so a regular coroutine pool could resume on a different thread and silently lose FAST2.
+            generationDispatcher = if (fastestCpuCount > 0) {
+                Executors.newSingleThreadExecutor { runnable ->
+                    Thread(runnable, "E2B-Generate-FAST$fastestCpuCount").apply {
+                        priority = Thread.MAX_PRIORITY
+                    }
+                }.asCoroutineDispatcher()
+            } else {
+                null
+            }
         } catch (t: Throwable) {
             runCatching { newEngine.close() }
+            runCatching { generationDispatcher?.close() }
+            generationDispatcher = null
             throw t
         } finally {
             runCatching { CpuAffinity.restore(originalMask) }
@@ -164,18 +183,34 @@ class SpeedLabEngine(private val cacheDirectory: File) : Closeable {
     suspend fun generate(
         prompt: String,
         onChunk: (String) -> Unit,
-    ): BenchmarkInfo = withContext(Dispatchers.Default) {
-        val active = conversation ?: error("GPU engine is not loaded")
+    ): BenchmarkInfo {
+        val dispatcher = generationDispatcher ?: Dispatchers.Default
+        return withContext(dispatcher) {
+            val active = conversation ?: error("GPU engine is not loaded")
+            val originalMask = if (activeFastestCpuCount > 0) CpuAffinity.currentMask() else 0L
 
-        active.sendMessageAsync(
-            text = prompt,
-            maxOutputToken = MAX_OUTPUT_TOKENS,
-            thinkingConfig = ThinkingConfig(enableThinking = false, thinkingTokenBudget = 0),
-        ).collect { message ->
-            onChunk(message.toString())
+            try {
+                if (activeFastestCpuCount > 0) {
+                    // Apply the Turbo winner to the whole host-side generation path, not only to
+                    // Engine initialization. For the verified profile this is FAST2 / mask 0xC0.
+                    activeAffinityMask = CpuAffinity.pinFast(activeFastestCpuCount)
+                }
+
+                active.sendMessageAsync(
+                    text = prompt,
+                    maxOutputToken = MAX_OUTPUT_TOKENS,
+                    thinkingConfig = ThinkingConfig(enableThinking = false, thinkingTokenBudget = 0),
+                ).collect { message ->
+                    onChunk(message.toString())
+                }
+
+                active.getBenchmarkInfo()
+            } finally {
+                if (activeFastestCpuCount > 0) {
+                    runCatching { CpuAffinity.restore(originalMask) }
+                }
+            }
         }
-
-        active.getBenchmarkInfo()
     }
 
     /**
@@ -388,6 +423,8 @@ class SpeedLabEngine(private val cacheDirectory: File) : Closeable {
         conversation = null
         runCatching { engine?.close() }
         engine = null
+        runCatching { generationDispatcher?.close() }
+        generationDispatcher = null
         activeContextTokens = MAX_CONTEXT_TOKENS
         activeFastestCpuCount = 0
         activeAffinityMask = 0L
