@@ -68,8 +68,6 @@ class NativeGpuBenchmarkService : Service() {
                             }
                         })
                     }
-                } finally {
-                    stopSelf()
                 }
             }
         }
