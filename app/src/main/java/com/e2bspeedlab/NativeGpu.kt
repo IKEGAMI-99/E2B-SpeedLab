@@ -1,29 +1,35 @@
 package com.e2bspeedlab
 
-import android.content.ComponentName
 import android.content.Context
-import android.content.Intent
-import android.content.ServiceConnection
-import android.os.Bundle
-import android.os.Handler
-import android.os.HandlerThread
-import android.os.IBinder
-import android.os.Message
-import android.os.Messenger
+import com.google.ai.edge.litertlm.Backend
+import com.google.ai.edge.litertlm.ConversationConfig
+import com.google.ai.edge.litertlm.Engine
+import com.google.ai.edge.litertlm.EngineConfig
+import com.google.ai.edge.litertlm.ExperimentalApi
+import com.google.ai.edge.litertlm.ExperimentalFlags
+import com.google.ai.edge.litertlm.LogSeverity
+import com.google.ai.edge.litertlm.SamplerConfig
+import com.google.ai.edge.litertlm.ThinkingConfig
 import java.io.File
-import java.util.concurrent.CountDownLatch
-import java.util.concurrent.TimeUnit
 
-/** Client for final LiteRT-LM 0.17.0 regular-GPU work in the isolated :nativegpu process. */
+/**
+ * Stable Turbo backend.
+ *
+ * v0.2.0/0.2.1 tried to benchmark the separately bundled final 0.17.0 C runtime. On the target
+ * Android GPU that runtime could inspect the model but the process died during GPU Engine creation.
+ * Turbo now deliberately uses the same Maven GPU runtime that already proves ~50 tok/s on-device,
+ * and only varies safe knobs around it: max context and caller-thread CPU affinity.
+ */
+@OptIn(ExperimentalApi::class)
 object NativeGpu {
 
+    // Kept for the legacy Service class so old process declarations remain harmless.
     internal const val MSG_BENCH = 101
     internal const val MSG_INSPECT = 102
     internal const val MSG_STARTED = 103
     internal const val MSG_RESULT = 104
     internal const val MSG_INSPECT_RESULT = 105
     internal const val MSG_ERROR = 106
-
     internal const val KEY_MODEL_PATH = "model_path"
     internal const val KEY_CACHE_DIR = "cache_dir"
     internal const val KEY_CONTEXT = "context"
@@ -34,10 +40,9 @@ object NativeGpu {
     internal const val KEY_INFO = "info"
     internal const val KEY_ERROR = "error"
 
-    private const val CONNECT_TIMEOUT_SECONDS = 20L
-    private const val INSPECT_TIMEOUT_SECONDS = 30L
-    private const val BENCH_TIMEOUT_SECONDS = 180L
-    private const val STAGE_FILE_NAME = "native_gpu_stage.txt"
+    private const val GENERIC_MODEL_BYTES = 2_588_147_712L
+    private const val GPU_MODEL_BYTES = 2_008_432_640L
+    private const val SIZE_TOLERANCE_BYTES = 96L * 1024L * 1024L
 
     @Volatile
     private var applicationContext: Context? = null
@@ -70,27 +75,23 @@ object NativeGpu {
     }
 
     fun inspect(modelPath: String): Capabilities {
-        val response = transact(
-            what = MSG_INSPECT,
-            timeoutSeconds = INSPECT_TIMEOUT_SECONDS,
-            cacheDir = null,
-        ) { bundle ->
-            bundle.putString(KEY_MODEL_PATH, modelPath)
+        val file = File(modelPath)
+        val bytes = file.length()
+        val generic = kotlin.math.abs(bytes - GENERIC_MODEL_BYTES) <= SIZE_TOLERANCE_BYTES
+        val dedicatedGpu = kotlin.math.abs(bytes - GPU_MODEL_BYTES) <= SIZE_TOLERANCE_BYTES
+        val mtp = when {
+            generic -> true
+            dedicatedGpu -> false
+            else -> null
         }
-        val raw = response.info ?: error("Native GPU inspection returned no capability data")
-        val values = raw.split(';')
-            .mapNotNull { item ->
-                val pos = item.indexOf('=')
-                if (pos <= 0) null else item.substring(0, pos) to item.substring(pos + 1)
-            }
-            .toMap()
+        val raw = "runtime=0.17.0-alpha1-stable-gpu;mtp=${when (mtp) { true -> "1"; false -> "0"; null -> "unknown" }};backends=GPU"
         return Capabilities(
-            runtime = values["runtime"],
-            supportsMtp = values["mtp"]?.let { it == "1" },
-            maxContext = values["max_context"]?.toIntOrNull()?.takeIf { it > 0 },
-            dynamicContext = values["dynamic"]?.let { it == "1" },
-            minRuntime = values["min_runtime"],
-            backends = values["backends"].orEmpty().split(',').filter { it.isNotBlank() },
+            runtime = "0.17.0-alpha1 stable GPU",
+            supportsMtp = mtp,
+            maxContext = null,
+            dynamicContext = null,
+            minRuntime = null,
+            backends = listOf("GPU"),
             raw = raw,
         )
     }
@@ -102,131 +103,74 @@ object NativeGpu {
         enableMtp: Boolean,
         fastestCpuCount: Int,
     ): Result {
-        require(maxContext in 768..32768)
+        require(maxContext in 768..4096)
         require(fastestCpuCount == 0 || fastestCpuCount == 2 || fastestCpuCount == 4)
-        val response = transact(
-            what = MSG_BENCH,
-            timeoutSeconds = BENCH_TIMEOUT_SECONDS,
-            cacheDir = cacheDir,
-        ) { bundle ->
-            bundle.putString(KEY_MODEL_PATH, modelPath)
-            bundle.putString(KEY_CACHE_DIR, cacheDir)
-            bundle.putInt(KEY_CONTEXT, maxContext)
-            bundle.putBoolean(KEY_MTP, enableMtp)
-            bundle.putInt(KEY_FAST_CPUS, fastestCpuCount)
-        }
-        val raw = checkNotNull(response.rawResult) { "Native GPU benchmark returned no result" }
-        check(raw.size == 7) { "Unexpected native GPU result size: ${raw.size}" }
-        return Result(
-            maxContext = maxContext,
-            mtpEnabled = enableMtp,
-            fastestCpuCount = fastestCpuCount,
-            initSeconds = raw[0],
-            ttftSeconds = raw[1],
-            prefillTokenCount = raw[2].toInt(),
-            decodeTokenCount = raw[3].toInt(),
-            prefillTokensPerSecond = raw[4],
-            decodeTokensPerSecond = raw[5],
-            affinityMask = raw[6].toLong(),
-        )
-    }
+        checkNotNull(applicationContext) { "NativeGpu is not initialized" }
 
-    private data class Response(
-        val rawResult: DoubleArray?,
-        val info: String?,
-    )
+        ExperimentalFlags.enableBenchmark = true
+        ExperimentalFlags.enableSpeculativeDecoding = enableMtp
+        Engine.setNativeMinLogSeverity(LogSeverity.ERROR)
 
-    private fun transact(
-        what: Int,
-        timeoutSeconds: Long,
-        cacheDir: String?,
-        fill: (Bundle) -> Unit,
-    ): Response {
-        val context = checkNotNull(applicationContext) { "NativeGpu is not initialized" }
-        cacheDir?.let { File(it, STAGE_FILE_NAME).delete() }
+        val cache = File(cacheDir).apply { mkdirs() }
+        val originalMask = CpuAffinity.currentMask()
+        val activeMask = if (fastestCpuCount > 0) CpuAffinity.pinFast(fastestCpuCount) else originalMask
 
-        val connected = CountDownLatch(1)
-        val completed = CountDownLatch(1)
-        val replyThread = HandlerThread("E2B-NativeGPU-Reply").apply { start() }
-
-        var service: Messenger? = null
-        var rawResult: DoubleArray? = null
-        var info: String? = null
-        var remoteError: String? = null
-        var disconnected = false
-
-        val replyMessenger = Messenger(object : Handler(replyThread.looper) {
-            override fun handleMessage(msg: Message) {
-                when (msg.what) {
-                    MSG_STARTED -> Unit
-                    MSG_RESULT -> {
-                        rawResult = msg.data.getDoubleArray(KEY_RESULT)
-                        completed.countDown()
-                    }
-                    MSG_INSPECT_RESULT -> {
-                        info = msg.data.getString(KEY_INFO)
-                        completed.countDown()
-                    }
-                    MSG_ERROR -> {
-                        remoteError = msg.data.getString(KEY_ERROR) ?: "Unknown native GPU process error"
-                        completed.countDown()
-                    }
-                }
-            }
-        })
-
-        val connection = object : ServiceConnection {
-            override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
-                service = binder?.let(::Messenger)
-                connected.countDown()
-            }
-
-            override fun onServiceDisconnected(name: ComponentName?) {
-                disconnected = true
-                completed.countDown()
-                connected.countDown()
-            }
-        }
-
-        var bound = false
-        try {
-            bound = context.bindService(
-                Intent(context, NativeGpuBenchmarkService::class.java),
-                connection,
-                Context.BIND_AUTO_CREATE,
+        val engine = Engine(
+            EngineConfig(
+                modelPath = modelPath,
+                backend = Backend.GPU(),
+                visionBackend = null,
+                audioBackend = null,
+                maxNumTokens = maxContext,
+                cacheDir = cache.absolutePath,
             )
-            check(bound) { "Could not start isolated native GPU service" }
-            check(connected.await(CONNECT_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
-                "Timed out connecting to native GPU process"
-            }
-            check(!disconnected) { "Native GPU process disconnected before starting" }
+        )
 
-            val request = Message.obtain(null, what).apply {
-                data = Bundle().also(fill)
-                replyTo = replyMessenger
-            }
-            checkNotNull(service) { "Native GPU service binder is unavailable" }.send(request)
-
-            if (!completed.await(timeoutSeconds, TimeUnit.SECONDS)) {
-                val stage = cacheDir?.let {
-                    runCatching { File(it, STAGE_FILE_NAME).readText().trim() }.getOrNull()
-                }.takeUnless { it.isNullOrBlank() } ?: "UNKNOWN"
-                throw RuntimeException(
-                    "Native GPU operation timed out after ${timeoutSeconds}s (stage: $stage)"
+        try {
+            engine.initialize()
+            engine.createConversation(
+                ConversationConfig(
+                    tools = emptyList(),
+                    automaticToolCalling = false,
+                    channels = emptyList(),
+                    samplerConfig = SamplerConfig(
+                        topK = 1,
+                        topP = 1.0,
+                        temperature = 0.0,
+                        seed = 0,
+                    ),
+                    prefillPrefaceOnInit = false,
+                    maxOutputToken = 256,
+                    thinkingConfig = ThinkingConfig(enableThinking = false, thinkingTokenBudget = 0),
+                    enableResponseFormat = false,
+                )
+            ).use { conversation ->
+                conversation.sendMessage(benchmarkPrompt())
+                val info = conversation.getBenchmarkInfo()
+                return Result(
+                    maxContext = maxContext,
+                    mtpEnabled = enableMtp,
+                    fastestCpuCount = fastestCpuCount,
+                    initSeconds = info.initTimeInSecond,
+                    ttftSeconds = info.timeToFirstTokenInSecond,
+                    prefillTokenCount = info.lastPrefillTokenCount,
+                    decodeTokenCount = info.lastDecodeTokenCount,
+                    prefillTokensPerSecond = info.lastPrefillTokensPerSecond,
+                    decodeTokensPerSecond = info.lastDecodeTokensPerSecond,
+                    affinityMask = activeMask,
                 )
             }
-            remoteError?.let { throw RuntimeException(it) }
-            check(!disconnected || rawResult != null || info != null) {
-                "Native GPU process terminated unexpectedly"
-            }
-            return Response(rawResult = rawResult, info = info)
         } finally {
-            if (bound) runCatching { context.unbindService(connection) }
-            // Do not kill :nativegpu here. The next Turbo measurement may bind immediately, and
-            // force-killing the process creates a restart race on OEM Android builds such as HyperOS.
-            // Each bind creates a fresh Service/executor thread, while the native benchmark itself
-            // destroys its Engine/Session before returning.
-            replyThread.quitSafely()
+            runCatching { engine.close() }
+            runCatching { CpuAffinity.restore(originalMask) }
+            ExperimentalFlags.enableSpeculativeDecoding = true
         }
+    }
+
+    private fun benchmarkPrompt() = buildString {
+        repeat(24) {
+            append("On-device language models benefit from low latency, efficient memory use, and fast token generation. ")
+        }
+        append("Explain the performance tradeoffs in detail.")
     }
 }
