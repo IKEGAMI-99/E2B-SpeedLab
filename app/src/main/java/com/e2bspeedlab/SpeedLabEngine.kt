@@ -28,25 +28,56 @@ class SpeedLabEngine(private val cacheDirectory: File) : Closeable {
         const val MAX_CONTEXT_TOKENS = 2048
         const val MAX_OUTPUT_TOKENS = 512
         const val BENCH_DECODE_TOKENS = 256
+        const val BENCH_SAMPLES_PER_MODE = 3
+        const val BENCH_WARMUP_RUNS = 2
+        const val BENCH_MEASURED_RUNS = BENCH_SAMPLES_PER_MODE * 2
+    }
+
+    data class BenchStats(val samples: List<BenchmarkInfo>) {
+        init {
+            require(samples.isNotEmpty()) { "Benchmark samples must not be empty" }
+        }
+
+        val decodeMedian: Double
+            get() = median(samples.map { it.lastDecodeTokensPerSecond })
+        val decodeMin: Double
+            get() = samples.minOf { it.lastDecodeTokensPerSecond }
+        val decodeMax: Double
+            get() = samples.maxOf { it.lastDecodeTokensPerSecond }
+
+        val prefillMedian: Double
+            get() = median(samples.map { it.lastPrefillTokensPerSecond })
+        val prefillMin: Double
+            get() = samples.minOf { it.lastPrefillTokensPerSecond }
+        val prefillMax: Double
+            get() = samples.maxOf { it.lastPrefillTokensPerSecond }
+
+        val ttftMedianSeconds: Double
+            get() = median(samples.map { it.timeToFirstTokenInSecond })
+        val ttftMinSeconds: Double
+            get() = samples.minOf { it.timeToFirstTokenInSecond }
+        val ttftMaxSeconds: Double
+            get() = samples.maxOf { it.timeToFirstTokenInSecond }
+
+        val initMedianSeconds: Double
+            get() = median(samples.map { it.initTimeInSecond })
     }
 
     data class MtpComparison(
-        val mtpOff: BenchmarkInfo,
-        val mtpOn: BenchmarkInfo,
+        val mtpOff: BenchStats,
+        val mtpOn: BenchStats,
+        val warmupOff: BenchmarkInfo,
+        val warmupOn: BenchmarkInfo,
+        val measuredOrder: List<Boolean>,
     ) {
         val decodeSpeedup: Double
-            get() = if (mtpOff.lastDecodeTokensPerSecond > 0.0) {
-                mtpOn.lastDecodeTokensPerSecond / mtpOff.lastDecodeTokensPerSecond
-            } else {
-                Double.NaN
-            }
+            get() = if (mtpOff.decodeMedian > 0.0) mtpOn.decodeMedian / mtpOff.decodeMedian else Double.NaN
 
         val prefillSpeedup: Double
-            get() = if (mtpOff.lastPrefillTokensPerSecond > 0.0) {
-                mtpOn.lastPrefillTokensPerSecond / mtpOff.lastPrefillTokensPerSecond
-            } else {
-                Double.NaN
-            }
+            get() = if (mtpOff.prefillMedian > 0.0) mtpOn.prefillMedian / mtpOff.prefillMedian else Double.NaN
+
+        val ttftRatio: Double
+            get() = if (mtpOff.ttftMedianSeconds > 0.0) mtpOn.ttftMedianSeconds / mtpOff.ttftMedianSeconds else Double.NaN
     }
 
     private var engine: Engine? = null
@@ -95,8 +126,12 @@ class SpeedLabEngine(private val cacheDirectory: File) : Closeable {
     }
 
     /**
-     * Runs the same native benchmark twice, sequentially, changing only speculative decoding.
-     * OFF is run first, then ON. Engines never coexist in memory.
+     * A less biased MTP A/B benchmark.
+     *
+     * First, one OFF and one ON run are used only as warmups and discarded. Then six measured runs
+     * are performed in a near-balanced ABBAAB order: OFF, ON, ON, OFF, OFF, ON. This gives three
+     * samples per mode while reducing first-run cache effects and linear thermal/order bias.
+     * Engines are strictly sequential and never coexist in memory.
      */
     suspend fun benchmarkMtpComparison(
         modelPath: String,
@@ -106,15 +141,37 @@ class SpeedLabEngine(private val cacheDirectory: File) : Closeable {
         cacheDirectory.mkdirs()
         Engine.setNativeMinLogSeverity(LogSeverity.ERROR)
 
-        onStage("MTP OFF")
-        val off = benchmarkOnce(modelPath, enableMtp = false)
+        try {
+            onStage("WARMUP 1/2 · MTP OFF")
+            val warmupOff = benchmarkOnce(modelPath, enableMtp = false)
 
-        onStage("MTP ON")
-        val on = benchmarkOnce(modelPath, enableMtp = true)
+            onStage("WARMUP 2/2 · MTP ON")
+            val warmupOn = benchmarkOnce(modelPath, enableMtp = true)
 
-        // Leave the global default in SpeedLab's normal fast-chat state.
-        configureRuntimeFlags(enableMtp = true)
-        MtpComparison(mtpOff = off, mtpOn = on)
+            // Three measured samples per mode. Position sums are almost equal (OFF=10, ON=11),
+            // which limits simple linear thermal drift from favoring one mode too strongly.
+            val measuredOrder = listOf(false, true, true, false, false, true)
+            val offSamples = ArrayList<BenchmarkInfo>(BENCH_SAMPLES_PER_MODE)
+            val onSamples = ArrayList<BenchmarkInfo>(BENCH_SAMPLES_PER_MODE)
+
+            measuredOrder.forEachIndexed { index, mtpEnabled ->
+                val mode = if (mtpEnabled) "ON" else "OFF"
+                onStage("${index + 1}/$BENCH_MEASURED_RUNS · MTP $mode")
+                val info = benchmarkOnce(modelPath, enableMtp = mtpEnabled)
+                if (mtpEnabled) onSamples += info else offSamples += info
+            }
+
+            MtpComparison(
+                mtpOff = BenchStats(offSamples),
+                mtpOn = BenchStats(onSamples),
+                warmupOff = warmupOff,
+                warmupOn = warmupOn,
+                measuredOrder = measuredOrder,
+            )
+        } finally {
+            // Normal chat mode is always GPU + MTP after benchmarking.
+            configureRuntimeFlags(enableMtp = true)
+        }
     }
 
     private fun benchmarkOnce(modelPath: String, enableMtp: Boolean): BenchmarkInfo {
@@ -124,8 +181,7 @@ class SpeedLabEngine(private val cacheDirectory: File) : Closeable {
         try {
             benchEngine.initialize()
             benchEngine.createConversation(fastConversationConfig(BENCH_DECODE_TOKENS)).use { benchConversation ->
-                val prompt = benchmarkPrompt()
-                benchConversation.sendMessage(prompt)
+                benchConversation.sendMessage(benchmarkPrompt())
                 return benchConversation.getBenchmarkInfo()
             }
         } finally {
@@ -188,5 +244,16 @@ class SpeedLabEngine(private val cacheDirectory: File) : Closeable {
         conversation = null
         runCatching { engine?.close() }
         engine = null
+    }
+}
+
+private fun median(values: List<Double>): Double {
+    require(values.isNotEmpty())
+    val sorted = values.sorted()
+    val middle = sorted.size / 2
+    return if (sorted.size % 2 == 1) {
+        sorted[middle]
+    } else {
+        (sorted[middle - 1] + sorted[middle]) / 2.0
     }
 }
