@@ -42,11 +42,13 @@ class MainActivity : Activity() {
         private const val SIZE_TOLERANCE_BYTES = 96L * 1024L * 1024L
 
         private const val UI_FLUSH_MS = 32L
+        private const val TURBO_VERIFY_SAMPLES = 5
         private val ARTISAN_STEPS = intArrayOf(1, 2, 4, 8)
         private val TURBO_CONTEXTS = intArrayOf(1024, 1536, 2048, 4096)
 
         private const val PREF_LAST_KOTLIN_MODEL = "last_kotlin_model"
         private const val PREF_LAST_KOTLIN_MTP_TPS = "last_kotlin_mtp_tps"
+        private const val PREF_TURBO_MODEL = "turbo_model"
         private const val PREF_TURBO_CONTEXT = "turbo_context"
         private const val PREF_TURBO_FAST_CPUS = "turbo_fast_cpus"
         private const val PREF_TURBO_TPS = "turbo_tps"
@@ -171,7 +173,7 @@ class MainActivity : Activity() {
         runRow.addView(resetButton, LinearLayout.LayoutParams(0, dp(48), 0.7f).apply { marginStart = dp(4) })
         root.addView(runRow, marginParams(top = 10, bottom = 4))
 
-        turboButton = actionButton("TURBO SWEEP  •  FINAL 0.17 GPU") { runTurboSweep() }
+        turboButton = actionButton("TURBO SWEEP  •  STABLE GPU") { runTurboSweep() }
         root.addView(turboButton, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(48)).apply {
             topMargin = dp(4)
             bottomMargin = dp(4)
@@ -184,7 +186,7 @@ class MainActivity : Activity() {
         })
 
         outputText = TextView(this).apply {
-            text = "Select a Gemma 4 E2B LiteRT-LM package. Generic + MTP currently has the best measured decode path; TURBO tests the final 0.17 GPU runtime directly.\n"
+            text = "Select a Gemma 4 E2B LiteRT-LM package. Generic + MTP currently has the best measured decode path; TURBO tunes the same proven Maven GPU runtime.\n"
             textSize = 15f
             setTextColor(Color.rgb(225, 229, 236))
             setTextIsSelectable(true)
@@ -287,14 +289,48 @@ class MainActivity : Activity() {
 
     private fun loadEngine() {
         if (!modelFile.exists()) return
+
+        val profileMatches = prefs().getString(PREF_TURBO_MODEL, null) == activeModelDisplayName()
+        val tunedContext = if (profileMatches) {
+            prefs().getInt(PREF_TURBO_CONTEXT, SpeedLabEngine.MAX_CONTEXT_TOKENS)
+        } else {
+            SpeedLabEngine.MAX_CONTEXT_TOKENS
+        }.coerceIn(768, 4096)
+        val tunedFastCpus = if (profileMatches) {
+            prefs().getInt(PREF_TURBO_FAST_CPUS, 0).takeIf { it == 2 || it == 4 } ?: 0
+        } else {
+            0
+        }
+        val profileLabel = if (profileMatches) {
+            "TURBO PROFILE • CTX $tunedContext • ${cpuModeLabel(tunedFastCpus)}"
+        } else {
+            "DEFAULT • CTX ${SpeedLabEngine.MAX_CONTEXT_TOKENS} • CPU ALL"
+        }
+
         setBusy(true, "INITIALIZING GPU + MTP")
-        outputText.text = "Loading ${modelKindLabel(currentModelKind())} with Maven LiteRT-LM GPU + MTP.\n"
+        outputText.text =
+            "Loading ${modelKindLabel(currentModelKind())} with Maven LiteRT-LM GPU + MTP.\n" +
+                "$profileLabel\n"
         scope.launch {
             try {
-                val seconds = speedLab.load(modelFile.absolutePath)
-                statusText.text = "STATUS  GPU + MTP ACTIVE"
-                metricsText.text = "DECODE  -- tok/s    PREFILL  -- tok/s\nTTFT  -- ms    LOAD  ${f(seconds, 2)} s"
-                outputText.append("Engine ready. Context=${SpeedLabEngine.MAX_CONTEXT_TOKENS}.\n")
+                val seconds = speedLab.load(
+                    modelPath = modelFile.absolutePath,
+                    maxContext = tunedContext,
+                    fastestCpuCount = tunedFastCpus,
+                )
+                statusText.text = if (profileMatches) {
+                    "STATUS  GPU + MTP • TURBO PROFILE"
+                } else {
+                    "STATUS  GPU + MTP ACTIVE"
+                }
+                metricsText.text =
+                    "DECODE  -- tok/s    PREFILL  -- tok/s\n" +
+                        "TTFT  -- ms    LOAD  ${f(seconds, 2)} s"
+                outputText.append(
+                    "Engine ready. Context=${speedLab.loadedContextTokens}; " +
+                        "${cpuModeLabel(speedLab.loadedFastestCpuCount)}; " +
+                        "init mask=${maskText(speedLab.loadedAffinityMask)}.\n"
+                )
             } catch (t: Throwable) {
                 showError("GPU engine failed to initialize", t)
             } finally {
@@ -360,8 +396,9 @@ class MainActivity : Activity() {
     }
 
     /**
-     * Safe regular-GPU optimization search using the bundled final 0.17.0 C API.
-     * This deliberately does not touch Artisan-only num_decode_steps_per_sync.
+     * Tunes only the Maven GPU runtime already proven stable on the target device.
+     * Candidate search is cheap (one run each), then the winning context/CPU configuration is
+     * verified with five OFF and five ON samples in a near-balanced order before it is persisted.
      */
     private fun runTurboSweep() {
         if (!modelFile.exists()) return
@@ -374,11 +411,12 @@ class MainActivity : Activity() {
         setBusy(true, "TURBO INSPECT")
         outputText.text =
             "TURBO SWEEP\n" +
-                "Final LiteRT-LM 0.17.0 C API • regular GPU backend\n" +
-                "1) Inspect packaged MTP capability\n" +
+                "Stable Maven LiteRT-LM 0.17.0-alpha1 • regular GPU backend\n" +
+                "1) Inspect known package capability\n" +
                 "2) Sweep context 1024 / 1536 / 2048 / 4096\n" +
                 "3) Sweep CPU affinity ALL / FAST4 / FAST2\n" +
-                "4) Re-test MTP OFF at the fastest configuration\n\n"
+                "4) Verify winner with MTP OFF/ON ×$TURBO_VERIFY_SAMPLES each\n" +
+                "5) Save verified winner as the normal LOAD profile\n\n"
 
         scope.launch {
             try {
@@ -393,7 +431,7 @@ class MainActivity : Activity() {
                 val mtpForSweep = capabilities.supportsMtp != false
                 if (capabilities.supportsMtp == false) {
                     outputText.append(
-                        "\nPackage reports MTP: NO. TURBO will measure the fastest regular-GPU path with MTP OFF; it will not pretend the switch works.\n"
+                        "\nPackage reports MTP: NO. TURBO will measure the regular-GPU path with MTP OFF.\n"
                     )
                 }
 
@@ -437,54 +475,111 @@ class MainActivity : Activity() {
                     }
                 }
 
-                val best = affinityRuns.maxBy { it.result.decodeTokensPerSecond }
-                val bestCpuLabel = cpuModeLabel(best.result.fastestCpuCount)
+                val searchWinner = affinityRuns.maxBy { it.result.decodeTokensPerSecond }
+                val bestCpuLabel = cpuModeLabel(searchWinner.result.fastestCpuCount)
 
-                var mtpOff: MeasuredNative? = null
+                var verifiedOnMedian = searchWinner.result.decodeTokensPerSecond
+                var verifiedOffMedian: Double? = null
+                var verifiedPrefillMedian = searchWinner.result.prefillTokensPerSecond
+                var verifiedTtftMedian = searchWinner.result.ttftSeconds
+                var verifiedMask = searchWinner.result.affinityMask
+
                 if (mtpForSweep) {
-                    statusText.text = "STATUS  TURBO VERIFY • MTP OFF"
-                    mtpOff = nativeMeasure(
-                        nativeCache,
-                        best.result.maxContext,
-                        false,
-                        best.result.fastestCpuCount,
+                    outputText.append(
+                        "\nTURBO VERIFY ×$TURBO_VERIFY_SAMPLES @ CTX ${searchWinner.result.maxContext} / $bestCpuLabel\n"
                     )
-                    outputText.append("\nMTP VERIFY\n")
-                    outputText.append(nativeLine("MTP OFF / $bestCpuLabel", mtpOff))
-                    outputText.append(nativeLine("MTP ON  / $bestCpuLabel", best))
+
+                    statusText.text = "STATUS  VERIFY WARMUP • MTP OFF"
+                    val verifyWarmOff = nativeMeasure(
+                        nativeCache,
+                        searchWinner.result.maxContext,
+                        false,
+                        searchWinner.result.fastestCpuCount,
+                    )
+                    statusText.text = "STATUS  VERIFY WARMUP • MTP ON"
+                    val verifyWarmOn = nativeMeasure(
+                        nativeCache,
+                        searchWinner.result.maxContext,
+                        true,
+                        searchWinner.result.fastestCpuCount,
+                    )
+                    outputText.append(
+                        "Warmup discarded: OFF ${f(verifyWarmOff.result.decodeTokensPerSecond, 1)} / " +
+                            "ON ${f(verifyWarmOn.result.decodeTokensPerSecond, 1)} tok/s\n"
+                    )
+
+                    // Five samples per mode. Position sums differ by only one (27 vs 28), limiting
+                    // simple linear thermal/order bias while still avoiding long same-mode streaks.
+                    val verifyOrder = listOf(false, true, true, false, false, true, true, false, false, true)
+                    val offRuns = ArrayList<MeasuredNative>(TURBO_VERIFY_SAMPLES)
+                    val onRuns = ArrayList<MeasuredNative>(TURBO_VERIFY_SAMPLES)
+
+                    verifyOrder.forEachIndexed { index, mtpOn ->
+                        val mode = if (mtpOn) "ON" else "OFF"
+                        statusText.text = "STATUS  TURBO VERIFY ${index + 1}/${verifyOrder.size} • MTP $mode"
+                        val measured = nativeMeasure(
+                            nativeCache,
+                            searchWinner.result.maxContext,
+                            mtpOn,
+                            searchWinner.result.fastestCpuCount,
+                        )
+                        if (mtpOn) onRuns += measured else offRuns += measured
+                    }
+
+                    verifiedOnMedian = median(onRuns.map { it.result.decodeTokensPerSecond })
+                    verifiedOffMedian = median(offRuns.map { it.result.decodeTokensPerSecond })
+                    verifiedPrefillMedian = median(onRuns.map { it.result.prefillTokensPerSecond })
+                    verifiedTtftMedian = median(onRuns.map { it.result.ttftSeconds })
+                    verifiedMask = onRuns.firstOrNull()?.result?.affinityMask ?: searchWinner.result.affinityMask
+
+                    val offValues = offRuns.joinToString(", ") { f(it.result.decodeTokensPerSecond, 1) }
+                    val onValues = onRuns.joinToString(", ") { f(it.result.decodeTokensPerSecond, 1) }
+                    val tempStart = (offRuns + onRuns).firstOrNull()?.batteryBeforeC
+                    val tempEnd = (offRuns + onRuns).lastOrNull()?.batteryAfterC
+                    val worstThermal = (offRuns + onRuns).maxOfOrNull { it.thermalAfter } ?: thermalStatus()
+
+                    outputText.append("MTP OFF runs: [$offValues]  median ${f(verifiedOffMedian, 1)} tok/s\n")
+                    outputText.append("MTP ON  runs: [$onValues]  median ${f(verifiedOnMedian, 1)} tok/s\n")
+                    outputText.append(
+                        "Verify temp: ${tempText(tempStart)}→${tempText(tempEnd)}  thermal ${thermalName(worstThermal)}\n"
+                    )
                 }
 
-                val mtpSpeedup = mtpOff?.result?.decodeTokensPerSecond
+                val mtpSpeedup = verifiedOffMedian
                     ?.takeIf { it > 0.0 }
-                    ?.let { best.result.decodeTokensPerSecond / it }
+                    ?.let { verifiedOnMedian / it }
 
                 prefs().edit()
-                    .putInt(PREF_TURBO_CONTEXT, best.result.maxContext)
-                    .putInt(PREF_TURBO_FAST_CPUS, best.result.fastestCpuCount)
-                    .putFloat(PREF_TURBO_TPS, best.result.decodeTokensPerSecond.toFloat())
+                    .putString(PREF_TURBO_MODEL, activeModelDisplayName())
+                    .putInt(PREF_TURBO_CONTEXT, searchWinner.result.maxContext)
+                    .putInt(PREF_TURBO_FAST_CPUS, searchWinner.result.fastestCpuCount)
+                    .putFloat(PREF_TURBO_TPS, verifiedOnMedian.toFloat())
                     .apply()
 
                 metricsText.text =
-                    "TURBO BEST  ${f(best.result.decodeTokensPerSecond, 1)} tok/s\n" +
-                        "CTX ${best.result.maxContext}  $bestCpuLabel" +
+                    "TURBO VERIFIED  ${f(verifiedOnMedian, 1)} tok/s median\n" +
+                        "CTX ${searchWinner.result.maxContext}  $bestCpuLabel" +
                         (mtpSpeedup?.let { "  MTP ${f(it, 2)}×" } ?: "")
-                statusText.text = "STATUS  TURBO COMPLETE"
+                statusText.text = "STATUS  TURBO VERIFIED ×$TURBO_VERIFY_SAMPLES"
 
-                outputText.append("\nRESULT\n")
-                outputText.append("  Runtime: final 0.17.0 C API\n")
-                outputText.append("  Best decode: ${f(best.result.decodeTokensPerSecond, 1)} tok/s\n")
-                outputText.append("  Best context: ${best.result.maxContext}\n")
+                outputText.append("\nRESULT — VERIFIED MEDIAN\n")
+                outputText.append("  Runtime: Maven LiteRT-LM 0.17.0-alpha1 GPU\n")
+                outputText.append("  Decode: ${f(verifiedOnMedian, 1)} tok/s\n")
+                outputText.append("  Best context: ${searchWinner.result.maxContext}\n")
                 outputText.append("  Best CPU mode: $bestCpuLabel\n")
-                outputText.append("  CPU mask: ${maskText(best.result.affinityMask)}\n")
-                outputText.append("  Prefill: ${f(best.result.prefillTokensPerSecond, 0)} tok/s\n")
-                outputText.append("  TTFT: ${f(best.result.ttftSeconds * 1000.0, 0)} ms\n")
+                outputText.append("  CPU mask: ${maskText(verifiedMask)}\n")
+                outputText.append("  Prefill median: ${f(verifiedPrefillMedian, 0)} tok/s\n")
+                outputText.append("  TTFT median: ${f(verifiedTtftMedian * 1000.0, 0)} ms\n")
                 if (mtpSpeedup != null) {
                     outputText.append(
                         "  MTP speedup: ${f(mtpSpeedup, 2)}× (${signed((mtpSpeedup - 1.0) * 100.0)}%)\n"
                     )
                 }
-                appendAlphaComparison(best.result.decodeTokensPerSecond)
-                outputText.append("\nReload GPU + MTP to return to normal chat.\n")
+                appendBaselineComparison(verifiedOnMedian)
+                outputText.append(
+                    "\nSaved as the normal LOAD profile. LOAD GPU + MTP will now initialize with " +
+                        "CTX ${searchWinner.result.maxContext} / $bestCpuLabel.\n"
+                )
             } catch (t: Throwable) {
                 showError("Turbo sweep failed", t)
             } finally {
@@ -522,8 +617,6 @@ class MainActivity : Activity() {
     private fun turboContexts(capabilities: NativeGpu.Capabilities): List<Int> {
         val max = capabilities.maxContext?.takeIf { it > 0 } ?: Int.MAX_VALUE
         if (capabilities.dynamicContext == false) {
-            // Do not force arbitrary graph dimensions on a fixed-context package. 2048 is the
-            // existing SpeedLab operating point if the package reports no more specific usable size.
             val fixed = capabilities.maxContext?.takeIf { it in 768..4096 } ?: 2048
             return listOf(fixed)
         }
@@ -534,7 +627,7 @@ class MainActivity : Activity() {
         outputText.append("PACKAGE INSPECT\n")
         outputText.append("  Runtime: ${cap.runtime ?: "unknown"}\n")
         outputText.append("  MTP packaged: ${when (cap.supportsMtp) { true -> "YES"; false -> "NO"; null -> "UNKNOWN" }}\n")
-        outputText.append("  Max context: ${cap.maxContext ?: 0}\n")
+        outputText.append("  Max context: ${cap.maxContext?.toString() ?: "UNKNOWN"}\n")
         outputText.append("  Dynamic context: ${when (cap.dynamicContext) { true -> "YES"; false -> "NO"; null -> "UNKNOWN" }}\n")
         outputText.append("  Text backends: ${cap.backends.ifEmpty { listOf("unknown") }.joinToString(", ")}\n")
         cap.minRuntime?.let { outputText.append("  Min runtime: $it\n") }
@@ -550,15 +643,15 @@ class MainActivity : Activity() {
             "  thermal ${thermalName(measured.thermalAfter)}\n"
     }
 
-    private fun appendAlphaComparison(finalTps: Double) {
+    private fun appendBaselineComparison(turboTps: Double) {
         val savedModel = prefs().getString(PREF_LAST_KOTLIN_MODEL, null)
-        val alphaTps = prefs().getFloat(PREF_LAST_KOTLIN_MTP_TPS, 0f).toDouble()
-        if (savedModel == activeModelDisplayName() && alphaTps > 0.0) {
-            val ratio = finalTps / alphaTps
-            outputText.append("\nRUNTIME COMPARISON\n")
-            outputText.append("  Maven 0.17.0-alpha1 MTP median: ${f(alphaTps, 1)} tok/s\n")
-            outputText.append("  Final 0.17.0 C GPU best: ${f(finalTps, 1)} tok/s\n")
-            outputText.append("  Final / alpha1: ${f(ratio, 2)}× (${signed((ratio - 1.0) * 100.0)}%)\n")
+        val baselineTps = prefs().getFloat(PREF_LAST_KOTLIN_MTP_TPS, 0f).toDouble()
+        if (savedModel == activeModelDisplayName() && baselineTps > 0.0) {
+            val ratio = turboTps / baselineTps
+            outputText.append("\nBASELINE COMPARISON\n")
+            outputText.append("  Default CTX 2048 / CPU ALL MTP median: ${f(baselineTps, 1)} tok/s\n")
+            outputText.append("  Turbo verified median: ${f(turboTps, 1)} tok/s\n")
+            outputText.append("  Turbo / baseline: ${f(ratio, 2)}× (${signed((ratio - 1.0) * 100.0)}%)\n")
         }
     }
 
@@ -646,7 +739,7 @@ class MainActivity : Activity() {
                 "  Backend: GPU\n" +
                 "  Package: ${modelKindLabel(currentModelKind())}\n" +
                 "  Samples: ${SpeedLabEngine.BENCH_SAMPLES_PER_MODE} per mode\n\n" +
-                "Run TURBO SWEEP to compare the final 0.17.0 native GPU runtime.\n"
+                "Run TURBO SWEEP to tune context and CPU affinity on the same stable GPU runtime.\n"
         )
     }
 
@@ -671,7 +764,9 @@ class MainActivity : Activity() {
         scope.launch {
             try {
                 speedLab.resetConversation()
-                outputText.text = "Conversation reset. Engine and compiled GPU cache remain loaded.\n"
+                outputText.text =
+                    "Conversation reset. Engine and compiled GPU cache remain loaded. " +
+                        "CTX ${speedLab.loadedContextTokens} / ${cpuModeLabel(speedLab.loadedFastestCpuCount)}.\n"
                 statusText.text = "STATUS  GPU + MTP ACTIVE"
             } catch (t: Throwable) {
                 showError("Reset failed", t)
@@ -751,17 +846,30 @@ class MainActivity : Activity() {
 
     private fun showPackageHint(overwrite: Boolean) {
         if (!modelFile.exists()) return
+        val profileMatches = prefs().getString(PREF_TURBO_MODEL, null) == activeModelDisplayName()
+        val profileText = if (profileMatches) {
+            val ctx = prefs().getInt(PREF_TURBO_CONTEXT, SpeedLabEngine.MAX_CONTEXT_TOKENS)
+            val cpus = prefs().getInt(PREF_TURBO_FAST_CPUS, 0)
+            val tps = prefs().getFloat(PREF_TURBO_TPS, 0f).toDouble()
+            "\nSaved Turbo profile: CTX $ctx / ${cpuModeLabel(cpus)}" +
+                if (tps > 0.0) " / ${f(tps, 1)} tok/s median.\n" else ".\n"
+        } else {
+            ""
+        }
         val text = when (currentModelKind()) {
             ModelKind.GENERIC ->
                 "GENERIC E2B package detected.\n" +
-                    "This package produced the strongest MTP decode result so far. Run MTP A/B ×3, then TURBO SWEEP to compare final LiteRT-LM 0.17.0 and CPU/context tuning.\n"
+                    "This package produced the strongest MTP decode result so far. Run MTP A/B ×3, then TURBO SWEEP for context/CPU tuning and ×$TURBO_VERIFY_SAMPLES verification.\n" +
+                    profileText
             ModelKind.GPU_OPT ->
                 "DEDICATED GPU package detected.\n" +
-                    "TURBO SWEEP will inspect whether this exact package declares MTP support before enabling it, then optimize the regular GPU path.\n"
+                    "This package previously showed little MTP gain. TURBO can still optimize its stable regular-GPU path.\n" +
+                    profileText
             ModelKind.ARTISAN ->
                 "GPU ARTISAN/HW package detected. Artisan SYNC sweep is enabled.\n"
             ModelKind.UNKNOWN ->
-                "Unknown E2B package. Regular GPU and TURBO inspection are allowed; Artisan-only tuning remains disabled.\n"
+                "Unknown E2B package. Regular GPU tuning is allowed; Artisan-only tuning remains disabled.\n" +
+                    profileText
         }
         if (overwrite) outputText.text = text else outputText.append(text)
     }
@@ -793,7 +901,9 @@ class MainActivity : Activity() {
 
     private fun updateControls() {
         val hasModel = modelFile.exists()
+        val profileMatches = hasModel && prefs().getString(PREF_TURBO_MODEL, null) == activeModelDisplayName()
         loadButton.isEnabled = !busy && hasModel
+        loadButton.text = if (profileMatches) "LOAD TURBO PROFILE" else "LOAD GPU + MTP"
         generateButton.isEnabled = !busy && speedLab.isLoaded
         benchmarkButton.isEnabled = !busy && hasModel
         turboButton.isEnabled = !busy && hasModel && currentModelKind() != ModelKind.ARTISAN
@@ -840,6 +950,13 @@ class MainActivity : Activity() {
         String.format(Locale.US, "%.${decimals}f", value)
 
     private fun signed(value: Double): String = if (value >= 0.0) "+${f(value, 1)}" else f(value, 1)
+
+    private fun median(values: List<Double>): Double {
+        require(values.isNotEmpty())
+        val sorted = values.sorted()
+        val middle = sorted.size / 2
+        return if (sorted.size % 2 == 1) sorted[middle] else (sorted[middle - 1] + sorted[middle]) / 2.0
+    }
 
     private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
 
