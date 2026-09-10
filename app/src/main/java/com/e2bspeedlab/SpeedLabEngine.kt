@@ -11,7 +11,6 @@ import com.google.ai.edge.litertlm.ExperimentalFlags
 import com.google.ai.edge.litertlm.LogSeverity
 import com.google.ai.edge.litertlm.SamplerConfig
 import com.google.ai.edge.litertlm.ThinkingConfig
-import com.google.ai.edge.litertlm.benchmark as liteRtBenchmark
 import java.io.Closeable
 import java.io.File
 import kotlinx.coroutines.Dispatchers
@@ -28,7 +27,6 @@ class SpeedLabEngine(private val cacheDirectory: File) : Closeable {
     companion object {
         const val MAX_CONTEXT_TOKENS = 2048
         const val MAX_OUTPUT_TOKENS = 512
-        const val BENCH_PREFILL_TOKENS = 256
         const val BENCH_DECODE_TOKENS = 256
     }
 
@@ -42,6 +40,7 @@ class SpeedLabEngine(private val cacheDirectory: File) : Closeable {
         closeInternal()
 
         // Gemma 4 MTP is exposed by LiteRT-LM as speculative decoding.
+        // 0.17.0-alpha1 exposes this as the engine-wide experimental flag.
         ExperimentalFlags.enableSpeculativeDecoding = true
         Engine.setNativeMinLogSeverity(LogSeverity.ERROR)
 
@@ -61,24 +60,7 @@ class SpeedLabEngine(private val cacheDirectory: File) : Closeable {
 
         try {
             newEngine.initialize()
-            val newConversation = newEngine.createConversation(
-                ConversationConfig(
-                    tools = emptyList(),
-                    automaticToolCalling = false,
-                    channels = emptyList(),
-                    samplerConfig = SamplerConfig(
-                        topK = 1,
-                        topP = 1.0,
-                        temperature = 0.0,
-                        seed = 0,
-                    ),
-                    prefillPrefaceOnInit = false,
-                    maxOutputToken = MAX_OUTPUT_TOKENS,
-                    thinkingConfig = ThinkingConfig(enableThinking = false, thinkingTokenBudget = 0),
-                    enableResponseFormat = false,
-                    enableSpeculativeDecoding = true,
-                )
-            )
+            val newConversation = newEngine.createConversation(fastConversationConfig(MAX_OUTPUT_TOKENS))
             engine = newEngine
             conversation = newConversation
         } catch (t: Throwable) {
@@ -107,45 +89,69 @@ class SpeedLabEngine(private val cacheDirectory: File) : Closeable {
     }
 
     /**
-     * Runs LiteRT-LM's native benchmark path. A live chat engine should be closed first to avoid
-     * keeping two copies of E2B resident at once.
+     * Benchmark on the same real GPU+MTP path used by chat. 0.17.0-alpha1 does not yet publish the
+     * newer top-level benchmark() Kotlin helper, so we create a temporary engine and read native
+     * BenchmarkInfo from the conversation itself.
      */
     suspend fun benchmark(modelPath: String): BenchmarkInfo = withContext(Dispatchers.Default) {
         closeInternal()
         ExperimentalFlags.enableSpeculativeDecoding = true
         cacheDirectory.mkdirs()
 
-        liteRtBenchmark(
-            modelPath = modelPath,
-            backend = Backend.GPU(),
-            prefillTokens = BENCH_PREFILL_TOKENS,
-            decodeTokens = BENCH_DECODE_TOKENS,
-            cacheDir = cacheDirectory.absolutePath,
-            prompt = "Explain in one paragraph why low latency matters for an on-device language model.",
+        val benchEngine = Engine(
+            EngineConfig(
+                modelPath = modelPath,
+                backend = Backend.GPU(),
+                visionBackend = null,
+                audioBackend = null,
+                maxNumTokens = MAX_CONTEXT_TOKENS,
+                cacheDir = cacheDirectory.absolutePath,
+            )
         )
+
+        try {
+            benchEngine.initialize()
+            benchEngine.createConversation(fastConversationConfig(BENCH_DECODE_TOKENS)).use { benchConversation ->
+                // Long enough to exercise prefill while leaving room for the 256-token decode cap.
+                val prompt = buildString {
+                    repeat(24) {
+                        append("On-device language models benefit from low latency, efficient memory use, and fast token generation. ")
+                    }
+                    append("Explain the performance tradeoffs in detail.")
+                }
+                benchConversation.sendMessage(prompt)
+                benchConversation.getBenchmarkInfo()
+            }
+        } finally {
+            runCatching { benchEngine.close() }
+        }
     }
 
     suspend fun resetConversation() = withContext(Dispatchers.Default) {
         val activeEngine = engine ?: return@withContext
         runCatching { conversation?.close() }
-        conversation = activeEngine.createConversation(
-            ConversationConfig(
-                tools = emptyList(),
-                automaticToolCalling = false,
-                channels = emptyList(),
-                samplerConfig = SamplerConfig(topK = 1, topP = 1.0, temperature = 0.0, seed = 0),
-                prefillPrefaceOnInit = false,
-                maxOutputToken = MAX_OUTPUT_TOKENS,
-                thinkingConfig = ThinkingConfig(enableThinking = false, thinkingTokenBudget = 0),
-                enableResponseFormat = false,
-                enableSpeculativeDecoding = true,
-            )
-        )
+        conversation = activeEngine.createConversation(fastConversationConfig(MAX_OUTPUT_TOKENS))
     }
 
     override fun close() {
         closeInternal()
     }
+
+    private fun fastConversationConfig(maxOutput: Int) = ConversationConfig(
+        tools = emptyList(),
+        automaticToolCalling = false,
+        channels = emptyList(),
+        samplerConfig = SamplerConfig(
+            topK = 1,
+            topP = 1.0,
+            temperature = 0.0,
+            seed = 0,
+        ),
+        prefillPrefaceOnInit = false,
+        maxOutputToken = maxOutput,
+        thinkingConfig = ThinkingConfig(enableThinking = false, thinkingTokenBudget = 0),
+        enableResponseFormat = false,
+    )
 
     private fun closeInternal() {
         runCatching { conversation?.close() }
