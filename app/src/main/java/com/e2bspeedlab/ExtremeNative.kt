@@ -11,6 +11,7 @@ import android.os.IBinder
 import android.os.Message
 import android.os.Messenger
 import android.os.Process
+import java.io.File
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 
@@ -38,6 +39,7 @@ object ExtremeNative {
 
     private const val CONNECT_TIMEOUT_SECONDS = 10L
     private const val RUN_TIMEOUT_SECONDS = 180L
+    private const val STAGE_FILE_NAME = "extreme_stage.txt"
 
     @Volatile
     private var applicationContext: Context? = null
@@ -65,6 +67,7 @@ object ExtremeNative {
     ): Result {
         require(decodeStepsPerSync in 1..32)
         val context = checkNotNull(applicationContext) { "ExtremeNative is not initialized" }
+        val stageFile = File(cacheDir, STAGE_FILE_NAME).apply { delete() }
 
         val connected = CountDownLatch(1)
         val completed = CountDownLatch(1)
@@ -130,9 +133,14 @@ object ExtremeNative {
             checkNotNull(service) { "Extreme benchmark service binder is unavailable" }.send(request)
 
             if (!completed.await(RUN_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
+                val stage = runCatching { stageFile.readText().trim() }
+                    .getOrNull()
+                    .takeUnless { it.isNullOrBlank() }
+                    ?: "UNKNOWN"
                 if (remotePid > 0) runCatching { Process.killProcess(remotePid) }
                 throw RuntimeException(
-                    "Extreme benchmark timed out after ${RUN_TIMEOUT_SECONDS}s at SYNC $decodeStepsPerSync"
+                    "Extreme benchmark timed out after ${RUN_TIMEOUT_SECONDS}s at SYNC $decodeStepsPerSync " +
+                        "(native stage: $stage)"
                 )
             }
             remoteError?.let { throw RuntimeException(it) }
