@@ -9,13 +9,17 @@ import android.os.Looper
 import android.os.Message
 import android.os.Messenger
 import android.os.Process
+import java.io.File
 import java.util.concurrent.Executors
 
-/**
- * Executes exactly one Extreme native benchmark request in the :extreme process.
- * The process is intentionally separate from the normal Maven LiteRT-LM JNI process.
- */
+/** Executes one Artisan-only native benchmark request in the dedicated :extreme process. */
 class ExtremeBenchmarkService : Service() {
+
+    companion object {
+        private const val GENERIC_MODEL_BYTES = 2_588_147_712L
+        private const val GPU_MODEL_BYTES = 2_008_432_640L
+        private const val SIZE_TOLERANCE_BYTES = 96L * 1024L * 1024L
+    }
 
     private val executor = Executors.newSingleThreadExecutor { runnable ->
         Thread(runnable, "E2B-Extreme-Native")
@@ -40,6 +44,14 @@ class ExtremeBenchmarkService : Service() {
 
             executor.execute {
                 try {
+                    val modelBytes = File(modelPath).length()
+                    if (nearSize(modelBytes, GENERIC_MODEL_BYTES) || nearSize(modelBytes, GPU_MODEL_BYTES)) {
+                        throw IllegalArgumentException(
+                            "Artisan SYNC tuning is not valid for the public generic or dedicated -gpu E2B package. " +
+                                "Use Backend.GPU() + MTP instead."
+                        )
+                    }
+
                     val raw = ExtremeNativeLocal.benchmark(modelPath, cacheDir, steps, mtp)
                     reply.send(Message.obtain(null, ExtremeNative.MSG_RESULT).apply {
                         data = Bundle().apply { putDoubleArray(ExtremeNative.KEY_RESULT, raw) }
@@ -61,6 +73,9 @@ class ExtremeBenchmarkService : Service() {
             }
         }
     })
+
+    private fun nearSize(actual: Long, expected: Long): Boolean =
+        kotlin.math.abs(actual - expected) <= SIZE_TOLERANCE_BYTES
 
     override fun onBind(intent: Intent?): IBinder = messenger.binder
 
