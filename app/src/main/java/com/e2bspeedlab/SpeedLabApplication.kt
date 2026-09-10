@@ -6,5 +6,6 @@ class SpeedLabApplication : Application() {
     override fun onCreate() {
         super.onCreate()
         ExtremeNative.init(this)
+        NativeGpu.init(this)
     }
 }
