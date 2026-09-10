@@ -21,8 +21,11 @@ class NativeGpuBenchmarkService : Service() {
     private val messenger = Messenger(object : Handler(Looper.getMainLooper()) {
         override fun handleMessage(msg: Message) {
             if (msg.what != NativeGpu.MSG_BENCH && msg.what != NativeGpu.MSG_INSPECT) return
+            val requestWhat = msg.what
             val reply = msg.replyTo ?: return
-            val request = msg.data
+            // Message objects may be recycled as soon as handleMessage returns. Copy everything the
+            // worker needs before handing work to another thread.
+            val request = Bundle(msg.data)
             val modelPath = request.getString(NativeGpu.KEY_MODEL_PATH).orEmpty()
 
             runCatching {
@@ -33,7 +36,7 @@ class NativeGpuBenchmarkService : Service() {
 
             executor.execute {
                 try {
-                    when (msg.what) {
+                    when (requestWhat) {
                         NativeGpu.MSG_INSPECT -> {
                             val info = NativeGpuLocal.inspect(modelPath)
                             reply.send(Message.obtain(null, NativeGpu.MSG_INSPECT_RESULT).apply {
