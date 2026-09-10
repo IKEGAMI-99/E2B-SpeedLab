@@ -10,7 +10,7 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
 
     steps:
       - name: Checkout
@@ -27,8 +27,61 @@ jobs:
         with:
           gradle-version: '9.6.0'
 
+      - name: Set up Android NDK r28b
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r28b
+          add-to-path: false
+
+      - name: Export NDK home
+        run: echo "ANDROID_NDK_HOME=${{ steps.setup-ndk.outputs.ndk-path }}" >> "$GITHUB_ENV"
+
+      - name: Install Bazelisk and Git LFS
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git-lfs
+          git lfs install
+          npm install -g @bazel/bazelisk
+
+      - name: Build LiteRT-LM v0.17.0 C API for ARM64
+        run: |
+          set -euxo pipefail
+          export GIT_LFS_SKIP_SMUDGE=1
+          git clone --depth 1 --branch v0.17.0 https://github.com/google-ai-edge/LiteRT-LM.git /tmp/LiteRT-LM
+          unset GIT_LFS_SKIP_SMUDGE
+          git -C /tmp/LiteRT-LM lfs pull --include="prebuilt/android_arm64/*"
+
+          cd /tmp/LiteRT-LM
+          bazelisk build \
+            --config=android_arm64 \
+            --define=litert_runtime_link_mode=dynamic \
+            //c:litert-lm
+
+          DEST="$GITHUB_WORKSPACE/app/src/main/jniLibs/arm64-v8a"
+          mkdir -p "$DEST"
+
+          CORE_SO="$(find bazel-bin/c -maxdepth 1 -type f -name 'liblitert-lm.so' -print -quit)"
+          test -n "$CORE_SO"
+          cp "$CORE_SO" "$DEST/liblitert-lm.so"
+
+          # Dynamic GPU/OpenCL support libraries used by LiteRT-LM's Android GPU path.
+          find prebuilt/android_arm64 -maxdepth 1 -type f -name '*.so' -exec cp -f {} "$DEST/" \;
+
+          echo "Packaged native libraries:"
+          ls -lh "$DEST"
+
+          # Fail CI early if the symbol v0.1.5 was missing is not exported by this library.
+          readelf -Ws "$DEST/liblitert-lm.so" | grep -q 'litert_lm_engine_settings_create'
+          readelf -Ws "$DEST/liblitert-lm.so" | grep -q 'litert_lm_engine_settings_set_gpu_decode_steps_per_sync'
+
       - name: Build debug APK
         run: gradle :app:assembleDebug --stacktrace
+
+      - name: Verify APK native payload
+        run: |
+          unzip -l app/build/outputs/apk/debug/app-debug.apk | grep 'lib/arm64-v8a/liblitert-lm.so'
+          unzip -l app/build/outputs/apk/debug/app-debug.apk | grep 'lib/arm64-v8a/libe2b_extreme.so'
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
