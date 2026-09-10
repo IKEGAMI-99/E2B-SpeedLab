@@ -38,12 +38,8 @@ class SpeedLabEngine(private val cacheDirectory: File) : Closeable {
 
     suspend fun load(modelPath: String): Double = withContext(Dispatchers.Default) {
         closeInternal()
-
-        // Gemma 4 MTP is exposed by LiteRT-LM as speculative decoding.
-        // 0.17.0-alpha1 exposes this as the engine-wide experimental flag.
-        ExperimentalFlags.enableSpeculativeDecoding = true
+        enableFastRuntimeFlags()
         Engine.setNativeMinLogSeverity(LogSeverity.ERROR)
-
         cacheDirectory.mkdirs()
 
         val started = System.nanoTime()
@@ -89,13 +85,11 @@ class SpeedLabEngine(private val cacheDirectory: File) : Closeable {
     }
 
     /**
-     * Benchmark on the same real GPU+MTP path used by chat. 0.17.0-alpha1 does not yet publish the
-     * newer top-level benchmark() Kotlin helper, so we create a temporary engine and read native
-     * BenchmarkInfo from the conversation itself.
+     * Benchmarks the exact same GPU + MTP path used by chat and returns native LiteRT-LM metrics.
      */
     suspend fun benchmark(modelPath: String): BenchmarkInfo = withContext(Dispatchers.Default) {
         closeInternal()
-        ExperimentalFlags.enableSpeculativeDecoding = true
+        enableFastRuntimeFlags()
         cacheDirectory.mkdirs()
 
         val benchEngine = Engine(
@@ -112,7 +106,6 @@ class SpeedLabEngine(private val cacheDirectory: File) : Closeable {
         try {
             benchEngine.initialize()
             benchEngine.createConversation(fastConversationConfig(BENCH_DECODE_TOKENS)).use { benchConversation ->
-                // Long enough to exercise prefill while leaving room for the 256-token decode cap.
                 val prompt = buildString {
                     repeat(24) {
                         append("On-device language models benefit from low latency, efficient memory use, and fast token generation. ")
@@ -135,6 +128,12 @@ class SpeedLabEngine(private val cacheDirectory: File) : Closeable {
 
     override fun close() {
         closeInternal()
+    }
+
+    /** These flags are sampled when Engine.initialize() creates the native EngineSettings. */
+    private fun enableFastRuntimeFlags() {
+        ExperimentalFlags.enableBenchmark = true
+        ExperimentalFlags.enableSpeculativeDecoding = true
     }
 
     private fun fastConversationConfig(maxOutput: Int) = ConversationConfig(
