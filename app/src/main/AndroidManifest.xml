@@ -21,6 +21,11 @@
             android:exported="false"
             android:process=":extreme" />
 
+        <service
+            android:name=".NativeGpuBenchmarkService"
+            android:exported="false"
+            android:process=":nativegpu" />
+
         <activity
             android:name=".MainActivity"
             android:exported="true"
