@@ -213,7 +213,6 @@ object NativeGpu {
                 val stage = cacheDir?.let {
                     runCatching { File(it, STAGE_FILE_NAME).readText().trim() }.getOrNull()
                 }.takeUnless { it.isNullOrBlank() } ?: "UNKNOWN"
-                if (remotePid > 0) runCatching { Process.killProcess(remotePid) }
                 throw RuntimeException(
                     "Native GPU operation timed out after ${timeoutSeconds}s (stage: $stage)"
                 )
@@ -225,6 +224,9 @@ object NativeGpu {
             return Response(rawResult = rawResult, info = info)
         } finally {
             if (bound) runCatching { context.unbindService(connection) }
+            // Every measurement starts from a fresh process. This resets sched_setaffinity and also
+            // prevents final-0.17 native state from leaking across A/B runs.
+            if (remotePid > 0) runCatching { Process.killProcess(remotePid) }
             replyThread.quitSafely()
         }
     }
