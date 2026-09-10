@@ -80,6 +80,28 @@ class SpeedLabEngine(private val cacheDirectory: File) : Closeable {
             get() = if (mtpOff.ttftMedianSeconds > 0.0) mtpOn.ttftMedianSeconds / mtpOff.ttftMedianSeconds else Double.NaN
     }
 
+    data class TurboSample(
+        val info: BenchmarkInfo,
+        val maxContext: Int,
+        val fastestCpuCount: Int,
+        val affinityMask: Long,
+    )
+
+    data class TurboSweep(
+        val warmup: TurboSample,
+        val contextRuns: List<TurboSample>,
+        val affinityRuns: List<TurboSample>,
+        val best: TurboSample,
+        val mtpOff: TurboSample,
+    ) {
+        val mtpSpeedup: Double
+            get() = if (mtpOff.info.lastDecodeTokensPerSecond > 0.0) {
+                best.info.lastDecodeTokensPerSecond / mtpOff.info.lastDecodeTokensPerSecond
+            } else {
+                Double.NaN
+            }
+    }
+
     private var engine: Engine? = null
     private var conversation: Conversation? = null
 
@@ -93,7 +115,7 @@ class SpeedLabEngine(private val cacheDirectory: File) : Closeable {
         cacheDirectory.mkdirs()
 
         val started = System.nanoTime()
-        val newEngine = createGpuEngine(modelPath)
+        val newEngine = createGpuEngine(modelPath, MAX_CONTEXT_TOKENS)
 
         try {
             newEngine.initialize()
@@ -148,8 +170,6 @@ class SpeedLabEngine(private val cacheDirectory: File) : Closeable {
             onStage("WARMUP 2/2 · MTP ON")
             val warmupOn = benchmarkOnce(modelPath, enableMtp = true)
 
-            // Three measured samples per mode. Position sums are almost equal (OFF=10, ON=11),
-            // which limits simple linear thermal drift from favoring one mode too strongly.
             val measuredOrder = listOf(false, true, true, false, false, true)
             val offSamples = ArrayList<BenchmarkInfo>(BENCH_SAMPLES_PER_MODE)
             val onSamples = ArrayList<BenchmarkInfo>(BENCH_SAMPLES_PER_MODE)
@@ -169,23 +189,116 @@ class SpeedLabEngine(private val cacheDirectory: File) : Closeable {
                 measuredOrder = measuredOrder,
             )
         } finally {
-            // Normal chat mode is always GPU + MTP after benchmarking.
             configureRuntimeFlags(enableMtp = true)
         }
     }
 
-    private fun benchmarkOnce(modelPath: String, enableMtp: Boolean): BenchmarkInfo {
-        configureRuntimeFlags(enableMtp)
-        val benchEngine = createGpuEngine(modelPath)
+    /**
+     * Safe Turbo sweep that stays on the already-proven Maven GPU runtime.
+     * No second LiteRT-LM C runtime is loaded, so there is no linker/GPU-driver ABI experiment here.
+     */
+    suspend fun benchmarkTurboSweep(
+        modelPath: String,
+        contexts: IntArray,
+        onStage: (String) -> Unit = {},
+    ): TurboSweep = withContext(Dispatchers.Default) {
+        closeInternal()
+        cacheDirectory.mkdirs()
+        Engine.setNativeMinLogSeverity(LogSeverity.ERROR)
 
+        val safeContexts = contexts.filter { it in 768..4096 }.distinct()
+        require(safeContexts.isNotEmpty()) { "No valid Turbo context candidates" }
+
+        try {
+            val warmContext = safeContexts.minBy { kotlin.math.abs(it - MAX_CONTEXT_TOKENS) }
+            onStage("TURBO WARMUP · CTX $warmContext")
+            val warmup = benchmarkOnceTuned(
+                modelPath = modelPath,
+                enableMtp = true,
+                maxContext = warmContext,
+                fastestCpuCount = 0,
+            )
+
+            val contextRuns = ArrayList<TurboSample>()
+            safeContexts.forEachIndexed { index, context ->
+                onStage("TURBO CTX ${index + 1}/${safeContexts.size} · $context")
+                runCatching {
+                    benchmarkOnceTuned(modelPath, true, context, 0)
+                }.onSuccess { contextRuns += it }
+            }
+            check(contextRuns.isNotEmpty()) { "Every context candidate failed" }
+
+            val bestContextRun = contextRuns.maxBy { it.info.lastDecodeTokensPerSecond }
+            val bestContext = bestContextRun.maxContext
+
+            val affinityRuns = ArrayList<TurboSample>()
+            affinityRuns += bestContextRun
+            intArrayOf(4, 2).forEachIndexed { index, fastCpus ->
+                onStage("TURBO CPU ${index + 1}/2 · FAST$fastCpus")
+                runCatching {
+                    benchmarkOnceTuned(modelPath, true, bestContext, fastCpus)
+                }.onSuccess { affinityRuns += it }
+            }
+
+            val best = affinityRuns.maxBy { it.info.lastDecodeTokensPerSecond }
+            onStage("TURBO VERIFY · MTP OFF")
+            val mtpOff = benchmarkOnceTuned(
+                modelPath = modelPath,
+                enableMtp = false,
+                maxContext = best.maxContext,
+                fastestCpuCount = best.fastestCpuCount,
+            )
+
+            TurboSweep(
+                warmup = warmup,
+                contextRuns = contextRuns,
+                affinityRuns = affinityRuns,
+                best = best,
+                mtpOff = mtpOff,
+            )
+        } finally {
+            configureRuntimeFlags(enableMtp = true)
+        }
+    }
+
+    private fun benchmarkOnce(modelPath: String, enableMtp: Boolean): BenchmarkInfo =
+        benchmarkOnceTuned(
+            modelPath = modelPath,
+            enableMtp = enableMtp,
+            maxContext = MAX_CONTEXT_TOKENS,
+            fastestCpuCount = 0,
+        ).info
+
+    private fun benchmarkOnceTuned(
+        modelPath: String,
+        enableMtp: Boolean,
+        maxContext: Int,
+        fastestCpuCount: Int,
+    ): TurboSample {
+        configureRuntimeFlags(enableMtp)
+
+        val originalMask = CpuAffinity.currentMask()
+        val activeMask = if (fastestCpuCount > 0) {
+            CpuAffinity.pinFast(fastestCpuCount)
+        } else {
+            originalMask
+        }
+
+        val benchEngine = createGpuEngine(modelPath, maxContext)
         try {
             benchEngine.initialize()
             benchEngine.createConversation(fastConversationConfig(BENCH_DECODE_TOKENS)).use { benchConversation ->
                 benchConversation.sendMessage(benchmarkPrompt())
-                return benchConversation.getBenchmarkInfo()
+                return TurboSample(
+                    info = benchConversation.getBenchmarkInfo(),
+                    maxContext = maxContext,
+                    fastestCpuCount = fastestCpuCount,
+                    affinityMask = activeMask,
+                )
             }
         } finally {
             runCatching { benchEngine.close() }
+            runCatching { CpuAffinity.restore(originalMask) }
         }
     }
 
@@ -205,13 +318,13 @@ class SpeedLabEngine(private val cacheDirectory: File) : Closeable {
         ExperimentalFlags.enableSpeculativeDecoding = enableMtp
     }
 
-    private fun createGpuEngine(modelPath: String) = Engine(
+    private fun createGpuEngine(modelPath: String, maxContext: Int) = Engine(
         EngineConfig(
             modelPath = modelPath,
             backend = Backend.GPU(),
             visionBackend = null,
             audioBackend = null,
-            maxNumTokens = MAX_CONTEXT_TOKENS,
+            maxNumTokens = maxContext,
             cacheDir = cacheDirectory.absolutePath,
         )
     )
