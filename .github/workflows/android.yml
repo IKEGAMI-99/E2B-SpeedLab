@@ -37,12 +37,15 @@ jobs:
       - name: Export NDK home
         run: echo "ANDROID_NDK_HOME=${{ steps.setup-ndk.outputs.ndk-path }}" >> "$GITHUB_ENV"
 
-      - name: Install Bazelisk and Git LFS
+      - name: Prepare Bazelisk and Git LFS
         run: |
           sudo apt-get update
           sudo apt-get install -y git-lfs
           git lfs install
-          npm install -g @bazel/bazelisk
+          if ! command -v bazelisk >/dev/null 2>&1; then
+            sudo npm install -g @bazel/bazelisk
+          fi
+          bazelisk --version
 
       - name: Build LiteRT-LM v0.17.0 C API for ARM64
         run: |
@@ -71,7 +74,7 @@ jobs:
           echo "Packaged native libraries:"
           ls -lh "$DEST"
 
-          # Fail CI early if the symbol v0.1.5 was missing is not exported by this library.
+          # Fail CI early if the symbols v0.1.5 could not see are not actually exported.
           readelf -Ws "$DEST/liblitert-lm.so" | grep -q 'litert_lm_engine_settings_create'
           readelf -Ws "$DEST/liblitert-lm.so" | grep -q 'litert_lm_engine_settings_set_gpu_decode_steps_per_sync'
 
