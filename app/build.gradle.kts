@@ -1,6 +1,5 @@
 plugins {
     id("com.android.application")
-    id("org.jetbrains.kotlin.android")
 }
 
 android {
@@ -35,10 +34,6 @@ android {
             excludes += setOf("META-INF/DEPENDENCIES", "META-INF/LICENSE*", "META-INF/NOTICE*")
         }
     }
-}
-
-kotlin {
-    jvmToolchain(21)
 }
 
 dependencies {
