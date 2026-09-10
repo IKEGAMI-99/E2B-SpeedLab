@@ -30,6 +30,25 @@ class SpeedLabEngine(private val cacheDirectory: File) : Closeable {
         const val BENCH_DECODE_TOKENS = 256
     }
 
+    data class MtpComparison(
+        val mtpOff: BenchmarkInfo,
+        val mtpOn: BenchmarkInfo,
+    ) {
+        val decodeSpeedup: Double
+            get() = if (mtpOff.lastDecodeTokensPerSecond > 0.0) {
+                mtpOn.lastDecodeTokensPerSecond / mtpOff.lastDecodeTokensPerSecond
+            } else {
+                Double.NaN
+            }
+
+        val prefillSpeedup: Double
+            get() = if (mtpOff.lastPrefillTokensPerSecond > 0.0) {
+                mtpOn.lastPrefillTokensPerSecond / mtpOff.lastPrefillTokensPerSecond
+            } else {
+                Double.NaN
+            }
+    }
+
     private var engine: Engine? = null
     private var conversation: Conversation? = null
 
@@ -38,21 +57,12 @@ class SpeedLabEngine(private val cacheDirectory: File) : Closeable {
 
     suspend fun load(modelPath: String): Double = withContext(Dispatchers.Default) {
         closeInternal()
-        enableFastRuntimeFlags()
+        configureRuntimeFlags(enableMtp = true)
         Engine.setNativeMinLogSeverity(LogSeverity.ERROR)
         cacheDirectory.mkdirs()
 
         val started = System.nanoTime()
-        val newEngine = Engine(
-            EngineConfig(
-                modelPath = modelPath,
-                backend = Backend.GPU(),
-                visionBackend = null,
-                audioBackend = null,
-                maxNumTokens = MAX_CONTEXT_TOKENS,
-                cacheDir = cacheDirectory.absolutePath,
-            )
-        )
+        val newEngine = createGpuEngine(modelPath)
 
         try {
             newEngine.initialize()
@@ -85,35 +95,38 @@ class SpeedLabEngine(private val cacheDirectory: File) : Closeable {
     }
 
     /**
-     * Benchmarks the exact same GPU + MTP path used by chat and returns native LiteRT-LM metrics.
+     * Runs the same native benchmark twice, sequentially, changing only speculative decoding.
+     * OFF is run first, then ON. Engines never coexist in memory.
      */
-    suspend fun benchmark(modelPath: String): BenchmarkInfo = withContext(Dispatchers.Default) {
+    suspend fun benchmarkMtpComparison(
+        modelPath: String,
+        onStage: (String) -> Unit = {},
+    ): MtpComparison = withContext(Dispatchers.Default) {
         closeInternal()
-        enableFastRuntimeFlags()
         cacheDirectory.mkdirs()
+        Engine.setNativeMinLogSeverity(LogSeverity.ERROR)
 
-        val benchEngine = Engine(
-            EngineConfig(
-                modelPath = modelPath,
-                backend = Backend.GPU(),
-                visionBackend = null,
-                audioBackend = null,
-                maxNumTokens = MAX_CONTEXT_TOKENS,
-                cacheDir = cacheDirectory.absolutePath,
-            )
-        )
+        onStage("MTP OFF")
+        val off = benchmarkOnce(modelPath, enableMtp = false)
+
+        onStage("MTP ON")
+        val on = benchmarkOnce(modelPath, enableMtp = true)
+
+        // Leave the global default in SpeedLab's normal fast-chat state.
+        configureRuntimeFlags(enableMtp = true)
+        MtpComparison(mtpOff = off, mtpOn = on)
+    }
+
+    private fun benchmarkOnce(modelPath: String, enableMtp: Boolean): BenchmarkInfo {
+        configureRuntimeFlags(enableMtp)
+        val benchEngine = createGpuEngine(modelPath)
 
         try {
             benchEngine.initialize()
             benchEngine.createConversation(fastConversationConfig(BENCH_DECODE_TOKENS)).use { benchConversation ->
-                val prompt = buildString {
-                    repeat(24) {
-                        append("On-device language models benefit from low latency, efficient memory use, and fast token generation. ")
-                    }
-                    append("Explain the performance tradeoffs in detail.")
-                }
+                val prompt = benchmarkPrompt()
                 benchConversation.sendMessage(prompt)
-                benchConversation.getBenchmarkInfo()
+                return benchConversation.getBenchmarkInfo()
             }
         } finally {
             runCatching { benchEngine.close() }
@@ -130,10 +143,28 @@ class SpeedLabEngine(private val cacheDirectory: File) : Closeable {
         closeInternal()
     }
 
-    /** These flags are sampled when Engine.initialize() creates the native EngineSettings. */
-    private fun enableFastRuntimeFlags() {
+    /** These flags are sampled when the native engine is created. */
+    private fun configureRuntimeFlags(enableMtp: Boolean) {
         ExperimentalFlags.enableBenchmark = true
-        ExperimentalFlags.enableSpeculativeDecoding = true
+        ExperimentalFlags.enableSpeculativeDecoding = enableMtp
+    }
+
+    private fun createGpuEngine(modelPath: String) = Engine(
+        EngineConfig(
+            modelPath = modelPath,
+            backend = Backend.GPU(),
+            visionBackend = null,
+            audioBackend = null,
+            maxNumTokens = MAX_CONTEXT_TOKENS,
+            cacheDir = cacheDirectory.absolutePath,
+        )
+    )
+
+    private fun benchmarkPrompt() = buildString {
+        repeat(24) {
+            append("On-device language models benefit from low latency, efficient memory use, and fast token generation. ")
+        }
+        append("Explain the performance tradeoffs in detail.")
     }
 
     private fun fastConversationConfig(maxOutput: Int) = ConversationConfig(
