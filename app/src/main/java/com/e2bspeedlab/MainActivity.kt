@@ -2,9 +2,12 @@ package com.e2bspeedlab
 
 import android.app.Activity
 import android.content.Intent
+import android.content.IntentFilter
 import android.graphics.Color
 import android.net.Uri
+import android.os.BatteryManager
 import android.os.Bundle
+import android.os.PowerManager
 import android.os.SystemClock
 import android.view.Gravity
 import android.view.View
@@ -33,7 +36,16 @@ class MainActivity : Activity() {
         private const val MODEL_FILE_NAME = "gemma-4-E2B-it.litertlm"
         private const val EXPECTED_MODEL_BYTES = 2_588_147_712L
         private const val UI_FLUSH_MS = 32L
+        private val EXTREME_STEPS = intArrayOf(1, 2, 4, 8)
     }
+
+    private data class ExtremeMeasured(
+        val result: ExtremeNative.Result,
+        val batteryBeforeC: Float?,
+        val batteryAfterC: Float?,
+        val thermalBefore: Int,
+        val thermalAfter: Int,
+    )
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
 
@@ -49,7 +61,9 @@ class MainActivity : Activity() {
     private lateinit var loadButton: Button
     private lateinit var generateButton: Button
     private lateinit var benchmarkButton: Button
+    private lateinit var extremeButton: Button
     private lateinit var resetButton: Button
+    private var busy = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -78,7 +92,7 @@ class MainActivity : Activity() {
         })
 
         root.addView(TextView(this).apply {
-            text = "Gemma 4 E2B  •  LiteRT-LM  •  GPU  •  MTP"
+            text = "Gemma 4 E2B  •  LiteRT-LM  •  GPU  •  MTP  •  EXTREME"
             textSize = 12f
             setTextColor(Color.rgb(150, 160, 176))
             setPadding(0, dp(3), 0, dp(14))
@@ -96,16 +110,15 @@ class MainActivity : Activity() {
         root.addView(modelText)
         root.addView(metricsText, marginParams(top = 10, bottom = 12))
 
-        val buttonRow = LinearLayout(this).apply {
+        val modelRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
         }
-
         val pickButton = actionButton("SELECT MODEL") { selectModel() }
         loadButton = actionButton("LOAD GPU + MTP") { loadEngine() }
-        buttonRow.addView(pickButton, LinearLayout.LayoutParams(0, dp(48), 1f).apply { marginEnd = dp(6) })
-        buttonRow.addView(loadButton, LinearLayout.LayoutParams(0, dp(48), 1f).apply { marginStart = dp(6) })
-        root.addView(buttonRow)
+        modelRow.addView(pickButton, LinearLayout.LayoutParams(0, dp(48), 1f).apply { marginEnd = dp(6) })
+        modelRow.addView(loadButton, LinearLayout.LayoutParams(0, dp(48), 1f).apply { marginStart = dp(6) })
+        root.addView(modelRow)
 
         progress = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
             visibility = View.GONE
@@ -130,16 +143,20 @@ class MainActivity : Activity() {
             ).apply { topMargin = dp(4) }
         )
 
-        val runRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-        }
+        val runRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         generateButton = actionButton("GENERATE") { generate() }
-        benchmarkButton = actionButton("BENCH MTP ×3") { runBenchmark() }
+        benchmarkButton = actionButton("MTP A/B ×3") { runBenchmark() }
         resetButton = actionButton("RESET") { resetConversation() }
         runRow.addView(generateButton, LinearLayout.LayoutParams(0, dp(48), 1f).apply { marginEnd = dp(4) })
         runRow.addView(benchmarkButton, LinearLayout.LayoutParams(0, dp(48), 1f).apply { marginStart = dp(4); marginEnd = dp(4) })
         runRow.addView(resetButton, LinearLayout.LayoutParams(0, dp(48), 0.7f).apply { marginStart = dp(4) })
-        root.addView(runRow, marginParams(top = 10, bottom = 10))
+        root.addView(runRow, marginParams(top = 10, bottom = 4))
+
+        extremeButton = actionButton("EXTREME SWEEP  •  GPU SYNC 1 / 2 / 4 / 8") { runExtremeSweep() }
+        root.addView(extremeButton, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(48)).apply {
+            topMargin = dp(4)
+            bottomMargin = dp(10)
+        })
 
         outputText = TextView(this).apply {
             text = "Select the MTP-capable gemma-4-E2B-it.litertlm model, then load the GPU engine.\n"
@@ -159,27 +176,6 @@ class MainActivity : Activity() {
         updateControls()
     }
 
-    private fun label(value: String, size: Float, color: Int) = TextView(this).apply {
-        text = value
-        textSize = size
-        setTextColor(color)
-    }
-
-    private fun actionButton(value: String, action: () -> Unit) = Button(this).apply {
-        text = value
-        isAllCaps = false
-        setOnClickListener { action() }
-    }
-
-    private fun marginParams(top: Int = 0, bottom: Int = 0) =
-        LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT,
-            LinearLayout.LayoutParams.WRAP_CONTENT
-        ).apply {
-            topMargin = dp(top)
-            bottomMargin = dp(bottom)
-        }
-
     private fun selectModel() {
         startActivityForResult(
             Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
@@ -194,8 +190,7 @@ class MainActivity : Activity() {
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
         if (requestCode != PICK_MODEL_REQUEST || resultCode != RESULT_OK) return
-        val uri = data?.data ?: return
-        importModel(uri)
+        data?.data?.let(::importModel)
     }
 
     private fun importModel(uri: Uri) {
@@ -203,13 +198,13 @@ class MainActivity : Activity() {
         scope.launch {
             try {
                 val bytes = withContext(Dispatchers.IO) { copyModel(uri, modelFile) }
-                statusText.text = "STATUS  MODEL READY"
                 modelText.text = "MODEL  ${formatGiB(bytes)} GiB  •  private storage"
-                if (kotlin.math.abs(bytes - EXPECTED_MODEL_BYTES) > 32L * 1024 * 1024) {
-                    outputText.text = "Warning: model size differs from the current official E2B package. SpeedLab will still allow loading it.\n"
+                outputText.text = if (kotlin.math.abs(bytes - EXPECTED_MODEL_BYTES) > 32L * 1024 * 1024) {
+                    "Warning: model size differs from the current official E2B package. SpeedLab will still allow loading it.\n"
                 } else {
-                    outputText.text = "Model imported. Load GPU + MTP to initialize LiteRT-LM.\n"
+                    "Model imported. Load GPU + MTP or run an Extreme sweep.\n"
                 }
+                statusText.text = "STATUS  MODEL READY"
             } catch (t: Throwable) {
                 modelFile.delete()
                 showError("Model import failed", t)
@@ -224,7 +219,6 @@ class MainActivity : Activity() {
         destination.parentFile?.mkdirs()
         val temp = File(destination.parentFile, destination.name + ".partial")
         temp.delete()
-
         var copied = 0L
         try {
             contentResolver.openInputStream(uri).use { input ->
@@ -237,9 +231,7 @@ class MainActivity : Activity() {
                         output.write(buffer, 0, count)
                         copied += count
                         if ((copied and ((64L * 1024 * 1024) - 1)) < count) {
-                            runOnUiThread {
-                                modelText.text = "COPYING  ${formatGiB(copied)} GiB"
-                            }
+                            runOnUiThread { modelText.text = "COPYING  ${formatGiB(copied)} GiB" }
                         }
                     }
                     output.fd.sync()
@@ -256,7 +248,7 @@ class MainActivity : Activity() {
     private fun loadEngine() {
         if (!modelFile.exists()) return
         setBusy(true, "INITIALIZING GPU + MTP")
-        outputText.text = "Loading E2B. First load can be much slower than later cached loads.\n"
+        outputText.text = "Loading E2B. First load can be slower than cached loads.\n"
         scope.launch {
             try {
                 val seconds = speedLab.load(modelFile.absolutePath)
@@ -267,7 +259,6 @@ class MainActivity : Activity() {
                 showError("GPU engine failed to initialize", t)
             } finally {
                 setBusy(false)
-                updateControls()
             }
         }
     }
@@ -275,7 +266,6 @@ class MainActivity : Activity() {
     private fun generate() {
         val prompt = promptInput.text.toString().trim()
         if (prompt.isEmpty() || !speedLab.isLoaded) return
-
         setBusy(true, "GENERATING")
         outputText.text = ""
 
@@ -300,7 +290,6 @@ class MainActivity : Activity() {
                 showError("Generation failed", t)
             } finally {
                 setBusy(false)
-                updateControls()
             }
         }
     }
@@ -310,10 +299,8 @@ class MainActivity : Activity() {
         setBusy(true, "MTP A/B MULTI-RUN")
         outputText.text =
             "Balanced native MTP A/B benchmark.\n" +
-                "Warmup: OFF → ON (discarded)\n" +
-                "Measured: OFF → ON → ON → OFF → OFF → ON\n" +
-                "Three measured samples per mode; final result uses the median.\n" +
-                "Only one E2B engine is resident at a time.\n\n"
+                "Warmup OFF → ON is discarded. Measured order is OFF → ON → ON → OFF → OFF → ON.\n" +
+                "Final result uses the median of three samples per mode.\n\n"
 
         scope.launch {
             try {
@@ -326,7 +313,95 @@ class MainActivity : Activity() {
                 showError("MTP A/B benchmark failed", t)
             } finally {
                 setBusy(false)
-                updateControls()
+            }
+        }
+    }
+
+    private fun runExtremeSweep() {
+        if (!modelFile.exists()) return
+        setBusy(true, "EXTREME PREPARING")
+        outputText.text =
+            "EXTREME MODE\n" +
+                "Direct LiteRT-LM C API benchmark with MTP ON.\n" +
+                "Testing GPU num_decode_steps_per_sync = 1 / 2 / 4 / 8.\n" +
+                "512-token prefill + 256-token decode. One steps=1 warmup is discarded.\n" +
+                "Battery temperature and Android thermal status are recorded around every run.\n\n"
+
+        scope.launch {
+            try {
+                // Native Extreme uses the same model and GPU library. Do not keep a Kotlin engine resident.
+                speedLab.close()
+                val extremeCache = File(cacheDir, "litertlm_extreme").apply { mkdirs() }
+
+                statusText.text = "STATUS  EXTREME WARMUP • SYNC 1"
+                val warmTemp = batteryTempC()
+                val warmup = withContext(Dispatchers.Default) {
+                    ExtremeNative.benchmark(modelFile.absolutePath, extremeCache.absolutePath, 1, true)
+                }
+                outputText.append(
+                    "WARMUP discarded: ${f(warmup.decodeTokensPerSecond, 1)} tok/s" +
+                        tempSuffix(warmTemp, batteryTempC()) + "\n\n"
+                )
+
+                val measured = ArrayList<ExtremeMeasured>(EXTREME_STEPS.size)
+                EXTREME_STEPS.forEachIndexed { index, steps ->
+                    val beforeTemp = batteryTempC()
+                    val beforeThermal = thermalStatus()
+                    statusText.text = "STATUS  EXTREME ${index + 1}/${EXTREME_STEPS.size} • SYNC $steps"
+
+                    val result = withContext(Dispatchers.Default) {
+                        ExtremeNative.benchmark(
+                            modelPath = modelFile.absolutePath,
+                            cacheDir = extremeCache.absolutePath,
+                            decodeStepsPerSync = steps,
+                            enableMtp = true,
+                        )
+                    }
+                    val afterTemp = batteryTempC()
+                    val afterThermal = thermalStatus()
+                    measured += ExtremeMeasured(result, beforeTemp, afterTemp, beforeThermal, afterThermal)
+
+                    outputText.append(
+                        "SYNC $steps  ${f(result.decodeTokensPerSecond, 1)} tok/s" +
+                            "  prefill ${f(result.prefillTokensPerSecond, 0)} tok/s" +
+                            "  TTFT ${f(result.ttftSeconds * 1000.0, 0)} ms" +
+                            tempSuffix(beforeTemp, afterTemp) +
+                            "  thermal ${thermalName(afterThermal)}\n"
+                    )
+                }
+
+                val best = measured.maxBy { it.result.decodeTokensPerSecond }
+                val baseline = measured.first { it.result.decodeStepsPerSync == 1 }
+                val speedup = best.result.decodeTokensPerSecond / baseline.result.decodeTokensPerSecond
+                val gain = (speedup - 1.0) * 100.0
+
+                getSharedPreferences("speedlab", MODE_PRIVATE)
+                    .edit()
+                    .putInt("best_decode_steps_per_sync", best.result.decodeStepsPerSync)
+                    .putFloat("best_extreme_tps", best.result.decodeTokensPerSecond.toFloat())
+                    .apply()
+
+                metricsText.text =
+                    "EXTREME BEST  ${f(best.result.decodeTokensPerSecond, 1)} tok/s\n" +
+                        "SYNC ${best.result.decodeStepsPerSync}   vs SYNC 1  ${f(speedup, 2)}× (${signed(gain)}%)"
+                statusText.text = "STATUS  EXTREME COMPLETE • BEST SYNC ${best.result.decodeStepsPerSync}"
+
+                outputText.append(
+                    "\nRESULT\n" +
+                        "  Best decode steps/sync: ${best.result.decodeStepsPerSync}\n" +
+                        "  Best decode: ${f(best.result.decodeTokensPerSecond, 1)} tok/s\n" +
+                        "  Baseline sync=1: ${f(baseline.result.decodeTokensPerSecond, 1)} tok/s\n" +
+                        "  Native tuning gain: ${f(speedup, 2)}× (${signed(gain)}%)\n" +
+                        "  Best TTFT: ${f(best.result.ttftSeconds * 1000.0, 0)} ms\n" +
+                        "  Best prefill: ${f(best.result.prefillTokensPerSecond, 0)} tok/s\n" +
+                        "  End battery temp: ${tempText(best.batteryAfterC)}\n" +
+                        "  End thermal: ${thermalName(best.thermalAfter)}\n\n" +
+                        "The public Kotlin EngineConfig cannot apply this knob yet. Extreme Mode reaches the exported LiteRT-LM C API directly. Reload GPU + MTP to return to normal chat.\n"
+                )
+            } catch (t: Throwable) {
+                showError("Extreme sweep failed", t)
+            } finally {
+                setBusy(false)
             }
         }
     }
@@ -353,7 +428,6 @@ class MainActivity : Activity() {
                 "  TTFT change: ${signed(ttftChangePercent)}%\n" +
                 "  Backend: GPU\n" +
                 "  Samples: ${SpeedLabEngine.BENCH_SAMPLES_PER_MODE} per mode\n\n" +
-                "MTP acceptance counters are not exposed by the LiteRT-LM Kotlin BenchmarkInfo API on the GPU path, so SpeedLab does not estimate or invent an acceptance rate.\n\n" +
                 "Reload GPU + MTP before using GENERATE again.\n"
         )
     }
@@ -362,16 +436,13 @@ class MainActivity : Activity() {
         val decodeSamples = stats.samples.joinToString(", ") { f(it.lastDecodeTokensPerSecond, 1) }
         val prefillSamples = stats.samples.joinToString(", ") { f(it.lastPrefillTokensPerSecond, 0) }
         val ttftSamples = stats.samples.joinToString(", ") { f(it.timeToFirstTokenInSecond * 1000.0, 0) }
-
         return title + "\n" +
             "  Decode median: ${f(stats.decodeMedian, 1)} tok/s\n" +
             "  Decode range: ${f(stats.decodeMin, 1)}–${f(stats.decodeMax, 1)} tok/s\n" +
             "  Decode runs: [$decodeSamples]\n" +
             "  Prefill median: ${f(stats.prefillMedian, 0)} tok/s\n" +
-            "  Prefill range: ${f(stats.prefillMin, 0)}–${f(stats.prefillMax, 0)} tok/s\n" +
             "  Prefill runs: [$prefillSamples]\n" +
             "  TTFT median: ${f(stats.ttftMedianSeconds * 1000.0, 0)} ms\n" +
-            "  TTFT range: ${f(stats.ttftMinSeconds * 1000.0, 0)}–${f(stats.ttftMaxSeconds * 1000.0, 0)} ms\n" +
             "  TTFT runs: [$ttftSamples] ms\n" +
             "  Init median: ${f(stats.initMedianSeconds, 2)} s\n"
     }
@@ -388,7 +459,6 @@ class MainActivity : Activity() {
                 showError("Reset failed", t)
             } finally {
                 setBusy(false)
-                updateControls()
             }
         }
     }
@@ -401,6 +471,31 @@ class MainActivity : Activity() {
                 "INIT  ${f(info.initTimeInSecond, 2)} s"
     }
 
+    private fun batteryTempC(): Float? {
+        val intent = registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED)) ?: return null
+        val tenths = intent.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, Int.MIN_VALUE)
+        return if (tenths == Int.MIN_VALUE) null else tenths / 10f
+    }
+
+    private fun thermalStatus(): Int =
+        (getSystemService(POWER_SERVICE) as PowerManager).currentThermalStatus
+
+    private fun thermalName(status: Int): String = when (status) {
+        PowerManager.THERMAL_STATUS_NONE -> "NONE"
+        PowerManager.THERMAL_STATUS_LIGHT -> "LIGHT"
+        PowerManager.THERMAL_STATUS_MODERATE -> "MODERATE"
+        PowerManager.THERMAL_STATUS_SEVERE -> "SEVERE"
+        PowerManager.THERMAL_STATUS_CRITICAL -> "CRITICAL"
+        PowerManager.THERMAL_STATUS_EMERGENCY -> "EMERGENCY"
+        PowerManager.THERMAL_STATUS_SHUTDOWN -> "SHUTDOWN"
+        else -> status.toString()
+    }
+
+    private fun tempSuffix(before: Float?, after: Float?): String =
+        if (before == null && after == null) "" else "  temp ${tempText(before)}→${tempText(after)}"
+
+    private fun tempText(value: Float?): String = value?.let { f(it.toDouble(), 1) + "°C" } ?: "--"
+
     private fun refreshModelState() {
         if (modelFile.exists()) {
             modelText.text = "MODEL  ${formatGiB(modelFile.length())} GiB  •  $MODEL_FILE_NAME"
@@ -412,26 +507,46 @@ class MainActivity : Activity() {
         updateControls()
     }
 
-    private fun setBusy(busy: Boolean, status: String? = null) {
-        progress.visibility = if (busy) View.VISIBLE else View.GONE
+    private fun setBusy(value: Boolean, status: String? = null) {
+        busy = value
+        progress.visibility = if (value) View.VISIBLE else View.GONE
         if (status != null) statusText.text = "STATUS  $status"
-        loadButton.isEnabled = !busy && modelFile.exists()
-        generateButton.isEnabled = !busy && speedLab.isLoaded
-        benchmarkButton.isEnabled = !busy && modelFile.exists()
-        resetButton.isEnabled = !busy && speedLab.isLoaded
+        updateControls()
     }
 
     private fun updateControls() {
-        loadButton.isEnabled = modelFile.exists()
-        generateButton.isEnabled = speedLab.isLoaded
-        benchmarkButton.isEnabled = modelFile.exists()
-        resetButton.isEnabled = speedLab.isLoaded
+        loadButton.isEnabled = !busy && modelFile.exists()
+        generateButton.isEnabled = !busy && speedLab.isLoaded
+        benchmarkButton.isEnabled = !busy && modelFile.exists()
+        extremeButton.isEnabled = !busy && modelFile.exists()
+        resetButton.isEnabled = !busy && speedLab.isLoaded
     }
 
     private fun showError(prefix: String, t: Throwable) {
         statusText.text = "STATUS  ERROR"
         outputText.append("\n$prefix:\n${t.javaClass.simpleName}: ${t.message ?: "unknown error"}\n")
     }
+
+    private fun label(value: String, size: Float, color: Int) = TextView(this).apply {
+        text = value
+        textSize = size
+        setTextColor(color)
+    }
+
+    private fun actionButton(value: String, action: () -> Unit) = Button(this).apply {
+        text = value
+        isAllCaps = false
+        setOnClickListener { action() }
+    }
+
+    private fun marginParams(top: Int = 0, bottom: Int = 0) =
+        LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT
+        ).apply {
+            topMargin = dp(top)
+            bottomMargin = dp(bottom)
+        }
 
     private fun formatGiB(bytes: Long): String = f(bytes / 1024.0 / 1024.0 / 1024.0, 2)
 
