@@ -122,15 +122,19 @@ class MainActivity : Activity() {
             minLines = 2
             maxLines = 4
         }
-        root.addView(promptInput, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
-            topMargin = dp(4)
-        })
+        root.addView(
+            promptInput,
+            LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = dp(4) }
+        )
 
         val runRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
         }
         generateButton = actionButton("GENERATE") { generate() }
-        benchmarkButton = actionButton("BENCH MTP A/B") { runBenchmark() }
+        benchmarkButton = actionButton("BENCH MTP ×3") { runBenchmark() }
         resetButton = actionButton("RESET") { resetConversation() }
         runRow.addView(generateButton, LinearLayout.LayoutParams(0, dp(48), 1f).apply { marginEnd = dp(4) })
         runRow.addView(benchmarkButton, LinearLayout.LayoutParams(0, dp(48), 1f).apply { marginStart = dp(4); marginEnd = dp(4) })
@@ -168,7 +172,10 @@ class MainActivity : Activity() {
     }
 
     private fun marginParams(top: Int = 0, bottom: Int = 0) =
-        LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+        LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT
+        ).apply {
             topMargin = dp(top)
             bottomMargin = dp(bottom)
         }
@@ -300,18 +307,21 @@ class MainActivity : Activity() {
 
     private fun runBenchmark() {
         if (!modelFile.exists()) return
-        setBusy(true, "MTP A/B BENCHMARK")
+        setBusy(true, "MTP A/B MULTI-RUN")
         outputText.text =
-            "Native A/B benchmark. The exact same GPU path and prompt are run sequentially.\n" +
-                "Chat engine is released first so only one E2B instance is resident at a time.\n\n"
+            "Balanced native MTP A/B benchmark.\n" +
+                "Warmup: OFF → ON (discarded)\n" +
+                "Measured: OFF → ON → ON → OFF → OFF → ON\n" +
+                "Three measured samples per mode; final result uses the median.\n" +
+                "Only one E2B engine is resident at a time.\n\n"
 
         scope.launch {
             try {
                 val result = speedLab.benchmarkMtpComparison(modelFile.absolutePath) { stage ->
-                    statusText.post { statusText.text = "STATUS  BENCHMARK $stage" }
+                    statusText.post { statusText.text = "STATUS  $stage" }
                 }
                 showComparison(result)
-                statusText.text = "STATUS  MTP A/B COMPLETE"
+                statusText.text = "STATUS  MTP A/B ×3 COMPLETE"
             } catch (t: Throwable) {
                 showError("MTP A/B benchmark failed", t)
             } finally {
@@ -325,36 +335,45 @@ class MainActivity : Activity() {
         val off = result.mtpOff
         val on = result.mtpOn
         val decodeGainPercent = (result.decodeSpeedup - 1.0) * 100.0
-        val ttftChangePercent = if (off.timeToFirstTokenInSecond > 0.0) {
-            (on.timeToFirstTokenInSecond / off.timeToFirstTokenInSecond - 1.0) * 100.0
-        } else {
-            Double.NaN
-        }
+        val ttftChangePercent = (result.ttftRatio - 1.0) * 100.0
 
         metricsText.text =
-            "MTP ON   ${f(on.lastDecodeTokensPerSecond, 1)} tok/s\n" +
-                "MTP OFF  ${f(off.lastDecodeTokensPerSecond, 1)} tok/s   SPEEDUP ${f(result.decodeSpeedup, 2)}×"
+            "MTP ON   ${f(on.decodeMedian, 1)} tok/s median\n" +
+                "MTP OFF  ${f(off.decodeMedian, 1)} tok/s   SPEEDUP ${f(result.decodeSpeedup, 2)}×"
 
         outputText.append(
-            "MTP OFF\n" +
-                "  Decode: ${f(off.lastDecodeTokensPerSecond, 1)} tok/s\n" +
-                "  Prefill: ${f(off.lastPrefillTokensPerSecond, 0)} tok/s\n" +
-                "  TTFT: ${f(off.timeToFirstTokenInSecond * 1000.0, 0)} ms\n" +
-                "  Init: ${f(off.initTimeInSecond, 2)} s\n" +
-                "  Tokens: ${off.lastPrefillTokenCount} prefill / ${off.lastDecodeTokenCount} decode\n\n" +
-                "MTP ON\n" +
-                "  Decode: ${f(on.lastDecodeTokensPerSecond, 1)} tok/s\n" +
-                "  Prefill: ${f(on.lastPrefillTokensPerSecond, 0)} tok/s\n" +
-                "  TTFT: ${f(on.timeToFirstTokenInSecond * 1000.0, 0)} ms\n" +
-                "  Init: ${f(on.initTimeInSecond, 2)} s\n" +
-                "  Tokens: ${on.lastPrefillTokenCount} prefill / ${on.lastDecodeTokenCount} decode\n\n" +
-                "RESULT\n" +
+            "WARMUP (discarded)\n" +
+                "  OFF: ${f(result.warmupOff.lastDecodeTokensPerSecond, 1)} tok/s\n" +
+                "  ON : ${f(result.warmupOn.lastDecodeTokensPerSecond, 1)} tok/s\n\n" +
+                statsBlock("MTP OFF", off) + "\n" +
+                statsBlock("MTP ON", on) + "\n" +
+                "RESULT — MEDIAN\n" +
                 "  Decode speedup: ${f(result.decodeSpeedup, 2)}× (${signed(decodeGainPercent)}%)\n" +
                 "  Prefill ratio: ${f(result.prefillSpeedup, 2)}×\n" +
                 "  TTFT change: ${signed(ttftChangePercent)}%\n" +
-                "  Backend: GPU\n\n" +
+                "  Backend: GPU\n" +
+                "  Samples: ${SpeedLabEngine.BENCH_SAMPLES_PER_MODE} per mode\n\n" +
+                "MTP acceptance counters are not exposed by the LiteRT-LM Kotlin BenchmarkInfo API on the GPU path, so SpeedLab does not estimate or invent an acceptance rate.\n\n" +
                 "Reload GPU + MTP before using GENERATE again.\n"
         )
+    }
+
+    private fun statsBlock(title: String, stats: SpeedLabEngine.BenchStats): String {
+        val decodeSamples = stats.samples.joinToString(", ") { f(it.lastDecodeTokensPerSecond, 1) }
+        val prefillSamples = stats.samples.joinToString(", ") { f(it.lastPrefillTokensPerSecond, 0) }
+        val ttftSamples = stats.samples.joinToString(", ") { f(it.timeToFirstTokenInSecond * 1000.0, 0) }
+
+        return title + "\n" +
+            "  Decode median: ${f(stats.decodeMedian, 1)} tok/s\n" +
+            "  Decode range: ${f(stats.decodeMin, 1)}–${f(stats.decodeMax, 1)} tok/s\n" +
+            "  Decode runs: [$decodeSamples]\n" +
+            "  Prefill median: ${f(stats.prefillMedian, 0)} tok/s\n" +
+            "  Prefill range: ${f(stats.prefillMin, 0)}–${f(stats.prefillMax, 0)} tok/s\n" +
+            "  Prefill runs: [$prefillSamples]\n" +
+            "  TTFT median: ${f(stats.ttftMedianSeconds * 1000.0, 0)} ms\n" +
+            "  TTFT range: ${f(stats.ttftMinSeconds * 1000.0, 0)}–${f(stats.ttftMaxSeconds * 1000.0, 0)} ms\n" +
+            "  TTFT runs: [$ttftSamples] ms\n" +
+            "  Init median: ${f(stats.initMedianSeconds, 2)} s\n"
     }
 
     private fun resetConversation() {
