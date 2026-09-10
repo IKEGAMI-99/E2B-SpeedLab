@@ -130,7 +130,7 @@ class MainActivity : Activity() {
             orientation = LinearLayout.HORIZONTAL
         }
         generateButton = actionButton("GENERATE") { generate() }
-        benchmarkButton = actionButton("BENCH 256/256") { runBenchmark() }
+        benchmarkButton = actionButton("BENCH MTP A/B") { runBenchmark() }
         resetButton = actionButton("RESET") { resetConversation() }
         runRow.addView(generateButton, LinearLayout.LayoutParams(0, dp(48), 1f).apply { marginEnd = dp(4) })
         runRow.addView(benchmarkButton, LinearLayout.LayoutParams(0, dp(48), 1f).apply { marginStart = dp(4); marginEnd = dp(4) })
@@ -300,27 +300,61 @@ class MainActivity : Activity() {
 
     private fun runBenchmark() {
         if (!modelFile.exists()) return
-        setBusy(true, "NATIVE BENCHMARK 256/256")
-        outputText.text = "Chat engine is released before benchmarking to avoid keeping two E2B instances resident.\n"
+        setBusy(true, "MTP A/B BENCHMARK")
+        outputText.text =
+            "Native A/B benchmark. The exact same GPU path and prompt are run sequentially.\n" +
+                "Chat engine is released first so only one E2B instance is resident at a time.\n\n"
 
         scope.launch {
             try {
-                val info = speedLab.benchmark(modelFile.absolutePath)
-                showMetrics(info)
-                statusText.text = "STATUS  BENCHMARK COMPLETE"
-                outputText.append(
-                    "\nNative LiteRT-LM benchmark complete.\n" +
-                        "Prefill tokens: ${info.lastPrefillTokenCount}\n" +
-                        "Decode tokens: ${info.lastDecodeTokenCount}\n" +
-                        "MTP: ON\nBackend: GPU\n"
-                )
+                val result = speedLab.benchmarkMtpComparison(modelFile.absolutePath) { stage ->
+                    statusText.post { statusText.text = "STATUS  BENCHMARK $stage" }
+                }
+                showComparison(result)
+                statusText.text = "STATUS  MTP A/B COMPLETE"
             } catch (t: Throwable) {
-                showError("Benchmark failed", t)
+                showError("MTP A/B benchmark failed", t)
             } finally {
                 setBusy(false)
                 updateControls()
             }
         }
+    }
+
+    private fun showComparison(result: SpeedLabEngine.MtpComparison) {
+        val off = result.mtpOff
+        val on = result.mtpOn
+        val decodeGainPercent = (result.decodeSpeedup - 1.0) * 100.0
+        val ttftChangePercent = if (off.timeToFirstTokenInSecond > 0.0) {
+            (on.timeToFirstTokenInSecond / off.timeToFirstTokenInSecond - 1.0) * 100.0
+        } else {
+            Double.NaN
+        }
+
+        metricsText.text =
+            "MTP ON   ${f(on.lastDecodeTokensPerSecond, 1)} tok/s\n" +
+                "MTP OFF  ${f(off.lastDecodeTokensPerSecond, 1)} tok/s   SPEEDUP ${f(result.decodeSpeedup, 2)}×"
+
+        outputText.append(
+            "MTP OFF\n" +
+                "  Decode: ${f(off.lastDecodeTokensPerSecond, 1)} tok/s\n" +
+                "  Prefill: ${f(off.lastPrefillTokensPerSecond, 0)} tok/s\n" +
+                "  TTFT: ${f(off.timeToFirstTokenInSecond * 1000.0, 0)} ms\n" +
+                "  Init: ${f(off.initTimeInSecond, 2)} s\n" +
+                "  Tokens: ${off.lastPrefillTokenCount} prefill / ${off.lastDecodeTokenCount} decode\n\n" +
+                "MTP ON\n" +
+                "  Decode: ${f(on.lastDecodeTokensPerSecond, 1)} tok/s\n" +
+                "  Prefill: ${f(on.lastPrefillTokensPerSecond, 0)} tok/s\n" +
+                "  TTFT: ${f(on.timeToFirstTokenInSecond * 1000.0, 0)} ms\n" +
+                "  Init: ${f(on.initTimeInSecond, 2)} s\n" +
+                "  Tokens: ${on.lastPrefillTokenCount} prefill / ${on.lastDecodeTokenCount} decode\n\n" +
+                "RESULT\n" +
+                "  Decode speedup: ${f(result.decodeSpeedup, 2)}× (${signed(decodeGainPercent)}%)\n" +
+                "  Prefill ratio: ${f(result.prefillSpeedup, 2)}×\n" +
+                "  TTFT change: ${signed(ttftChangePercent)}%\n" +
+                "  Backend: GPU\n\n" +
+                "Reload GPU + MTP before using GENERATE again.\n"
+        )
     }
 
     private fun resetConversation() {
@@ -384,6 +418,9 @@ class MainActivity : Activity() {
 
     private fun f(value: Double, decimals: Int): String =
         String.format(Locale.US, "%.${decimals}f", value)
+
+    private fun signed(value: Double): String =
+        if (value >= 0.0) "+${f(value, 1)}" else f(value, 1)
 
     private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
 
