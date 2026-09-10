@@ -104,27 +104,58 @@ class SpeedLabEngine(private val cacheDirectory: File) : Closeable {
 
     private var engine: Engine? = null
     private var conversation: Conversation? = null
+    private var activeContextTokens: Int = MAX_CONTEXT_TOKENS
+    private var activeFastestCpuCount: Int = 0
+    private var activeAffinityMask: Long = 0L
 
     val isLoaded: Boolean
         get() = engine != null && conversation != null
 
-    suspend fun load(modelPath: String): Double = withContext(Dispatchers.Default) {
+    val loadedContextTokens: Int
+        get() = activeContextTokens
+
+    val loadedFastestCpuCount: Int
+        get() = activeFastestCpuCount
+
+    val loadedAffinityMask: Long
+        get() = activeAffinityMask
+
+    suspend fun load(
+        modelPath: String,
+        maxContext: Int = MAX_CONTEXT_TOKENS,
+        fastestCpuCount: Int = 0,
+    ): Double = withContext(Dispatchers.Default) {
+        require(maxContext in 768..4096) { "Context must be between 768 and 4096" }
+        require(fastestCpuCount == 0 || fastestCpuCount == 2 || fastestCpuCount == 4) {
+            "CPU mode must be ALL, FAST2, or FAST4"
+        }
+
         closeInternal()
         configureRuntimeFlags(enableMtp = true)
         Engine.setNativeMinLogSeverity(LogSeverity.ERROR)
         cacheDirectory.mkdirs()
 
+        val originalMask = CpuAffinity.currentMask()
+        val tunedMask = if (fastestCpuCount > 0) CpuAffinity.pinFast(fastestCpuCount) else originalMask
         val started = System.nanoTime()
-        val newEngine = createGpuEngine(modelPath, MAX_CONTEXT_TOKENS)
+        val newEngine = createGpuEngine(modelPath, maxContext)
 
         try {
+            // Engine/GPU worker creation happens while the caller is pinned. Newly-created Linux
+            // threads inherit the creator's affinity mask, while the coroutine worker is restored
+            // before returning to the shared Dispatchers.Default pool.
             newEngine.initialize()
             val newConversation = newEngine.createConversation(fastConversationConfig(MAX_OUTPUT_TOKENS))
             engine = newEngine
             conversation = newConversation
+            activeContextTokens = maxContext
+            activeFastestCpuCount = fastestCpuCount
+            activeAffinityMask = tunedMask
         } catch (t: Throwable) {
             runCatching { newEngine.close() }
             throw t
+        } finally {
+            runCatching { CpuAffinity.restore(originalMask) }
         }
 
         (System.nanoTime() - started) / 1_000_000_000.0
@@ -357,6 +388,9 @@ class SpeedLabEngine(private val cacheDirectory: File) : Closeable {
         conversation = null
         runCatching { engine?.close() }
         engine = null
+        activeContextTokens = MAX_CONTEXT_TOKENS
+        activeFastestCpuCount = 0
+        activeAffinityMask = 0L
     }
 }
 
