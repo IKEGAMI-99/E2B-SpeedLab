@@ -10,8 +10,8 @@ android {
         applicationId = "com.e2bspeedlab"
         minSdk = 31
         targetSdk = 37
-        versionCode = 1
-        versionName = "0.1.0"
+        versionCode = 2
+        versionName = "0.1.1"
     }
 
     buildTypes {
@@ -36,7 +36,18 @@ android {
     }
 }
 
+configurations.configureEach {
+    resolutionStrategy.force(
+        "org.jetbrains.kotlinx:kotlinx-coroutines-core-jvm:1.11.0",
+        "org.jetbrains.kotlinx:kotlinx-coroutines-android:1.11.0",
+    )
+}
+
 dependencies {
     implementation("com.google.ai.edge.litertlm:litertlm-android:0.17.0-alpha1")
-    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2")
+
+    // LiteRT-LM currently builds against coroutines 1.11.0. Keep both artifacts pinned to the
+    // same ABI so Conversation.sendMessageAsync() does not crash with SendChannel.close$default.
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core-jvm:1.11.0")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.11.0")
 }
