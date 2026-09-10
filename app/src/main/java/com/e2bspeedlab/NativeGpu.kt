@@ -10,7 +10,6 @@ import android.os.HandlerThread
 import android.os.IBinder
 import android.os.Message
 import android.os.Messenger
-import android.os.Process
 import java.io.File
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
@@ -35,7 +34,7 @@ object NativeGpu {
     internal const val KEY_INFO = "info"
     internal const val KEY_ERROR = "error"
 
-    private const val CONNECT_TIMEOUT_SECONDS = 10L
+    private const val CONNECT_TIMEOUT_SECONDS = 20L
     private const val INSPECT_TIMEOUT_SECONDS = 30L
     private const val BENCH_TIMEOUT_SECONDS = 180L
     private const val STAGE_FILE_NAME = "native_gpu_stage.txt"
@@ -88,7 +87,7 @@ object NativeGpu {
         return Capabilities(
             runtime = values["runtime"],
             supportsMtp = values["mtp"]?.let { it == "1" },
-            maxContext = values["max_context"]?.toIntOrNull(),
+            maxContext = values["max_context"]?.toIntOrNull()?.takeIf { it > 0 },
             dynamicContext = values["dynamic"]?.let { it == "1" },
             minRuntime = values["min_runtime"],
             backends = values["backends"].orEmpty().split(',').filter { it.isNotBlank() },
@@ -151,7 +150,6 @@ object NativeGpu {
         val replyThread = HandlerThread("E2B-NativeGPU-Reply").apply { start() }
 
         var service: Messenger? = null
-        var remotePid = -1
         var rawResult: DoubleArray? = null
         var info: String? = null
         var remoteError: String? = null
@@ -160,7 +158,7 @@ object NativeGpu {
         val replyMessenger = Messenger(object : Handler(replyThread.looper) {
             override fun handleMessage(msg: Message) {
                 when (msg.what) {
-                    MSG_STARTED -> remotePid = msg.data.getInt(KEY_PID, -1)
+                    MSG_STARTED -> Unit
                     MSG_RESULT -> {
                         rawResult = msg.data.getDoubleArray(KEY_RESULT)
                         completed.countDown()
@@ -224,9 +222,10 @@ object NativeGpu {
             return Response(rawResult = rawResult, info = info)
         } finally {
             if (bound) runCatching { context.unbindService(connection) }
-            // Every measurement starts from a fresh process. This resets sched_setaffinity and also
-            // prevents final-0.17 native state from leaking across A/B runs.
-            if (remotePid > 0) runCatching { Process.killProcess(remotePid) }
+            // Do not kill :nativegpu here. The next Turbo measurement may bind immediately, and
+            // force-killing the process creates a restart race on OEM Android builds such as HyperOS.
+            // Each bind creates a fresh Service/executor thread, while the native benchmark itself
+            // destroys its Engine/Session before returning.
             replyThread.quitSafely()
         }
     }
