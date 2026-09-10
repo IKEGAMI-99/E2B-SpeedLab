@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: e2b-speedlab-android-v2-${{ github.ref }}
+  group: e2b-speedlab-android-v3-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -85,6 +85,10 @@ jobs:
 
           readelf -Ws "$DEST/liblitert-lm.so" | grep -q 'litert_lm_engine_settings_create'
           readelf -Ws "$DEST/liblitert-lm.so" | grep -q 'litert_lm_engine_settings_set_gpu_decode_steps_per_sync'
+          readelf -Ws "$DEST/liblitert-lm.so" | grep -q 'litert_lm_engine_settings_set_gpu_wait_for_weight_uploads'
+          readelf -Ws "$DEST/liblitert-lm.so" | grep -q 'litert_lm_loaded_file_create'
+          readelf -Ws "$DEST/liblitert-lm.so" | grep -q 'litert_lm_loaded_file_has_speculative_decoding_support'
+          readelf -Ws "$DEST/liblitert-lm.so" | grep -q 'litert_lm_loaded_file_max_context_tokens'
 
       - name: Build debug APK
         run: gradle :app:assembleDebug --stacktrace
@@ -94,13 +98,20 @@ jobs:
           set -euxo pipefail
           unzip -l app/build/outputs/apk/debug/app-debug.apk | grep 'lib/arm64-v8a/liblitert-lm.so'
           unzip -l app/build/outputs/apk/debug/app-debug.apk | grep 'lib/arm64-v8a/libe2b_extreme.so'
+          unzip -l app/build/outputs/apk/debug/app-debug.apk | grep 'lib/arm64-v8a/libe2b_nativegpu.so'
 
           rm -rf /tmp/apk-native
           mkdir -p /tmp/apk-native
-          unzip -q app/build/outputs/apk/debug/app-debug.apk 'lib/arm64-v8a/liblitert-lm.so' 'lib/arm64-v8a/libe2b_extreme.so' -d /tmp/apk-native
-          readelf -Ws /tmp/apk-native/lib/arm64-v8a/liblitert-lm.so | grep -q 'litert_lm_engine_settings_create'
-          readelf -Ws /tmp/apk-native/lib/arm64-v8a/liblitert-lm.so | grep -q 'litert_lm_engine_settings_set_gpu_decode_steps_per_sync'
+          unzip -q app/build/outputs/apk/debug/app-debug.apk \
+            'lib/arm64-v8a/liblitert-lm.so' \
+            'lib/arm64-v8a/libe2b_extreme.so' \
+            'lib/arm64-v8a/libe2b_nativegpu.so' \
+            -d /tmp/apk-native
+
+          readelf -Ws /tmp/apk-native/lib/arm64-v8a/liblitert-lm.so | grep -q 'litert_lm_loaded_file_has_speculative_decoding_support'
           readelf -Ws /tmp/apk-native/lib/arm64-v8a/libe2b_extreme.so | grep -q 'Java_com_e2bspeedlab_ExtremeNativeLocal_nativeBenchmark'
+          readelf -Ws /tmp/apk-native/lib/arm64-v8a/libe2b_nativegpu.so | grep -q 'Java_com_e2bspeedlab_NativeGpuLocal_nativeInspect'
+          readelf -Ws /tmp/apk-native/lib/arm64-v8a/libe2b_nativegpu.so | grep -q 'Java_com_e2bspeedlab_NativeGpuLocal_nativeBenchmark'
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
