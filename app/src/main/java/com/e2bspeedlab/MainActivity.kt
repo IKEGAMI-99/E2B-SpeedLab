@@ -9,6 +9,7 @@ import android.os.BatteryManager
 import android.os.Bundle
 import android.os.PowerManager
 import android.os.SystemClock
+import android.provider.OpenableColumns
 import android.view.Gravity
 import android.view.View
 import android.view.WindowManager
@@ -33,10 +34,25 @@ class MainActivity : Activity() {
 
     companion object {
         private const val PICK_MODEL_REQUEST = 7001
+
+        // Keep the legacy private filename so upgrading does not force a 2+ GiB re-import.
+        // The original selected filename is now preserved separately for package classification.
         private const val MODEL_FILE_NAME = "gemma-4-E2B-it.litertlm"
-        private const val EXPECTED_MODEL_BYTES = 2_588_147_712L
+        private const val MODEL_NAME_PREF = "active_model_display_name"
+
+        private const val GENERIC_MODEL_BYTES = 2_588_147_712L
+        private const val GPU_MODEL_BYTES = 2_008_432_640L
+        private const val SIZE_TOLERANCE_BYTES = 96L * 1024L * 1024L
+
         private const val UI_FLUSH_MS = 32L
         private val EXTREME_STEPS = intArrayOf(1, 2, 4, 8)
+    }
+
+    private enum class ModelKind {
+        GENERIC,
+        GPU_OPT,
+        ARTISAN,
+        UNKNOWN,
     }
 
     private data class ExtremeMeasured(
@@ -75,6 +91,7 @@ class MainActivity : Activity() {
 
         buildUi()
         refreshModelState()
+        if (modelFile.exists()) showPackageHint(overwrite = true)
     }
 
     private fun buildUi() {
@@ -92,7 +109,7 @@ class MainActivity : Activity() {
         })
 
         root.addView(TextView(this).apply {
-            text = "Gemma 4 E2B  •  LiteRT-LM  •  GPU  •  MTP  •  EXTREME"
+            text = "Gemma 4 E2B  •  LiteRT-LM  •  GPU  •  MTP"
             textSize = 12f
             setTextColor(Color.rgb(150, 160, 176))
             setPadding(0, dp(3), 0, dp(14))
@@ -148,18 +165,24 @@ class MainActivity : Activity() {
         benchmarkButton = actionButton("MTP A/B ×3") { runBenchmark() }
         resetButton = actionButton("RESET") { resetConversation() }
         runRow.addView(generateButton, LinearLayout.LayoutParams(0, dp(48), 1f).apply { marginEnd = dp(4) })
-        runRow.addView(benchmarkButton, LinearLayout.LayoutParams(0, dp(48), 1f).apply { marginStart = dp(4); marginEnd = dp(4) })
+        runRow.addView(benchmarkButton, LinearLayout.LayoutParams(0, dp(48), 1f).apply {
+            marginStart = dp(4)
+            marginEnd = dp(4)
+        })
         runRow.addView(resetButton, LinearLayout.LayoutParams(0, dp(48), 0.7f).apply { marginStart = dp(4) })
         root.addView(runRow, marginParams(top = 10, bottom = 4))
 
-        extremeButton = actionButton("EXTREME SWEEP  •  GPU SYNC 1 / 2 / 4 / 8") { runExtremeSweep() }
-        root.addView(extremeButton, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(48)).apply {
-            topMargin = dp(4)
-            bottomMargin = dp(10)
-        })
+        extremeButton = actionButton("ARTISAN SYNC SWEEP  •  HW MODEL ONLY") { runExtremeSweep() }
+        root.addView(
+            extremeButton,
+            LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(48)).apply {
+                topMargin = dp(4)
+                bottomMargin = dp(10)
+            }
+        )
 
         outputText = TextView(this).apply {
-            text = "Select the MTP-capable gemma-4-E2B-it.litertlm model, then load the GPU engine.\n"
+            text = "Select a Gemma 4 E2B LiteRT-LM package. For maximum speed, the dedicated gemma-4-E2B-it-gpu.litertlm package is preferred.\n"
             textSize = 15f
             setTextColor(Color.rgb(225, 229, 236))
             setTextIsSelectable(true)
@@ -197,22 +220,45 @@ class MainActivity : Activity() {
         setBusy(true, "IMPORTING MODEL")
         scope.launch {
             try {
+                speedLab.close()
+                val originalName = queryDisplayName(uri)
                 val bytes = withContext(Dispatchers.IO) { copyModel(uri, modelFile) }
-                modelText.text = "MODEL  ${formatGiB(bytes)} GiB  •  private storage"
-                outputText.text = if (kotlin.math.abs(bytes - EXPECTED_MODEL_BYTES) > 32L * 1024 * 1024) {
-                    "Warning: model size differs from the current official E2B package. SpeedLab will still allow loading it.\n"
-                } else {
-                    "Model imported. Load GPU + MTP or run an Extreme sweep.\n"
-                }
+                getSharedPreferences("speedlab", MODE_PRIVATE)
+                    .edit()
+                    .putString(MODEL_NAME_PREF, originalName)
+                    .apply()
+
                 statusText.text = "STATUS  MODEL READY"
+                refreshModelState()
+                showPackageHint(overwrite = true)
+
+                if (currentModelKind() == ModelKind.UNKNOWN) {
+                    outputText.append(
+                        "\nPackage size: ${formatGiB(bytes)} GiB. This package is not one of SpeedLab's known generic/GPU/Artisan E2B profiles; normal GPU loading is still allowed.\n"
+                    )
+                }
             } catch (t: Throwable) {
                 modelFile.delete()
+                getSharedPreferences("speedlab", MODE_PRIVATE).edit().remove(MODEL_NAME_PREF).apply()
                 showError("Model import failed", t)
             } finally {
                 setBusy(false)
                 refreshModelState()
             }
         }
+    }
+
+    private fun queryDisplayName(uri: Uri): String {
+        var result = uri.lastPathSegment ?: "selected-model.litertlm"
+        runCatching {
+            contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
+                if (cursor.moveToFirst()) {
+                    val index = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                    if (index >= 0) cursor.getString(index)?.takeIf { it.isNotBlank() }?.let { result = it }
+                }
+            }
+        }
+        return result.substringAfterLast('/')
     }
 
     private fun copyModel(uri: Uri, destination: File): Long {
@@ -248,13 +294,15 @@ class MainActivity : Activity() {
     private fun loadEngine() {
         if (!modelFile.exists()) return
         setBusy(true, "INITIALIZING GPU + MTP")
-        outputText.text = "Loading E2B. First load can be slower than cached loads.\n"
+        outputText.text = "Loading ${modelKindLabel(currentModelKind())} E2B package with Backend.GPU() + MTP.\n"
         scope.launch {
             try {
                 val seconds = speedLab.load(modelFile.absolutePath)
                 statusText.text = "STATUS  GPU + MTP ACTIVE"
                 metricsText.text = "DECODE  -- tok/s    PREFILL  -- tok/s\nTTFT  -- ms    LOAD  ${f(seconds, 2)} s"
-                outputText.append("Engine ready. Context=${SpeedLabEngine.MAX_CONTEXT_TOKENS}, max output=${SpeedLabEngine.MAX_OUTPUT_TOKENS}.\n")
+                outputText.append(
+                    "Engine ready. Context=${SpeedLabEngine.MAX_CONTEXT_TOKENS}, max output=${SpeedLabEngine.MAX_OUTPUT_TOKENS}.\n"
+                )
             } catch (t: Throwable) {
                 showError("GPU engine failed to initialize", t)
             } finally {
@@ -298,7 +346,9 @@ class MainActivity : Activity() {
         if (!modelFile.exists()) return
         setBusy(true, "MTP A/B MULTI-RUN")
         outputText.text =
-            "Balanced native MTP A/B benchmark.\n" +
+            "Package: ${modelKindLabel(currentModelKind())} • ${activeModelDisplayName()}\n" +
+                "Backend: GPU\n" +
+                "Balanced MTP A/B benchmark.\n" +
                 "Warmup OFF → ON is discarded. Measured order is OFF → ON → ON → OFF → OFF → ON.\n" +
                 "Final result uses the median of three samples per mode.\n\n"
 
@@ -317,23 +367,34 @@ class MainActivity : Activity() {
         }
     }
 
+    /**
+     * num_decode_steps_per_sync is an Artisan-only knob upstream. The normal public E2B package
+     * and the dedicated -gpu package both use the regular GPU backend, so deliberately refuse to
+     * force them through GPU_ARTISAN. v0.1.8 did that and could kill the child process.
+     */
     private fun runExtremeSweep() {
         if (!modelFile.exists()) return
-        setBusy(true, "EXTREME PREPARING")
+        if (currentModelKind() != ModelKind.ARTISAN) {
+            statusText.text = "STATUS  ARTISAN MODEL REQUIRED"
+            outputText.text = artisanUnavailableMessage()
+            updateControls()
+            return
+        }
+
+        setBusy(true, "ARTISAN PREPARING")
         outputText.text =
-            "EXTREME MODE\n" +
+            "ARTISAN EXTREME MODE\n" +
                 "Direct LiteRT-LM C API benchmark with MTP ON.\n" +
-                "Testing GPU num_decode_steps_per_sync = 1 / 2 / 4 / 8.\n" +
+                "Testing GPU Artisan num_decode_steps_per_sync = 1 / 2 / 4 / 8.\n" +
                 "512-token prefill + 256-token decode. One steps=1 warmup is discarded.\n" +
                 "Battery temperature and Android thermal status are recorded around every run.\n\n"
 
         scope.launch {
             try {
-                // Native Extreme uses the same model and GPU library. Do not keep a Kotlin engine resident.
                 speedLab.close()
                 val extremeCache = File(cacheDir, "litertlm_extreme").apply { mkdirs() }
 
-                statusText.text = "STATUS  EXTREME WARMUP • SYNC 1"
+                statusText.text = "STATUS  ARTISAN WARMUP • SYNC 1"
                 val warmTemp = batteryTempC()
                 val warmup = withContext(Dispatchers.Default) {
                     ExtremeNative.benchmark(modelFile.absolutePath, extremeCache.absolutePath, 1, true)
@@ -347,7 +408,7 @@ class MainActivity : Activity() {
                 EXTREME_STEPS.forEachIndexed { index, steps ->
                     val beforeTemp = batteryTempC()
                     val beforeThermal = thermalStatus()
-                    statusText.text = "STATUS  EXTREME ${index + 1}/${EXTREME_STEPS.size} • SYNC $steps"
+                    statusText.text = "STATUS  ARTISAN ${index + 1}/${EXTREME_STEPS.size} • SYNC $steps"
 
                     val result = withContext(Dispatchers.Default) {
                         ExtremeNative.benchmark(
@@ -382,9 +443,9 @@ class MainActivity : Activity() {
                     .apply()
 
                 metricsText.text =
-                    "EXTREME BEST  ${f(best.result.decodeTokensPerSecond, 1)} tok/s\n" +
+                    "ARTISAN BEST  ${f(best.result.decodeTokensPerSecond, 1)} tok/s\n" +
                         "SYNC ${best.result.decodeStepsPerSync}   vs SYNC 1  ${f(speedup, 2)}× (${signed(gain)}%)"
-                statusText.text = "STATUS  EXTREME COMPLETE • BEST SYNC ${best.result.decodeStepsPerSync}"
+                statusText.text = "STATUS  ARTISAN COMPLETE • BEST SYNC ${best.result.decodeStepsPerSync}"
 
                 outputText.append(
                     "\nRESULT\n" +
@@ -396,10 +457,10 @@ class MainActivity : Activity() {
                         "  Best prefill: ${f(best.result.prefillTokensPerSecond, 0)} tok/s\n" +
                         "  End battery temp: ${tempText(best.batteryAfterC)}\n" +
                         "  End thermal: ${thermalName(best.thermalAfter)}\n\n" +
-                        "The public Kotlin EngineConfig cannot apply this knob yet. Extreme Mode reaches the exported LiteRT-LM C API directly. Reload GPU + MTP to return to normal chat.\n"
+                        "Reload GPU + MTP to return to normal chat.\n"
                 )
             } catch (t: Throwable) {
-                showError("Extreme sweep failed", t)
+                showError("Artisan sweep failed", t)
             } finally {
                 setBusy(false)
             }
@@ -427,6 +488,7 @@ class MainActivity : Activity() {
                 "  Prefill ratio: ${f(result.prefillSpeedup, 2)}×\n" +
                 "  TTFT change: ${signed(ttftChangePercent)}%\n" +
                 "  Backend: GPU\n" +
+                "  Package: ${modelKindLabel(currentModelKind())}\n" +
                 "  Samples: ${SpeedLabEngine.BENCH_SAMPLES_PER_MODE} per mode\n\n" +
                 "Reload GPU + MTP before using GENERATE again.\n"
         )
@@ -496,10 +558,74 @@ class MainActivity : Activity() {
 
     private fun tempText(value: Float?): String = value?.let { f(it.toDouble(), 1) + "°C" } ?: "--"
 
+    private fun activeModelDisplayName(): String {
+        val prefsName = getSharedPreferences("speedlab", MODE_PRIVATE).getString(MODEL_NAME_PREF, null)
+        if (!prefsName.isNullOrBlank()) return prefsName
+        return when (classifyModel(null, modelFile.length())) {
+            ModelKind.GENERIC -> "gemma-4-E2B-it.litertlm"
+            ModelKind.GPU_OPT -> "gemma-4-E2B-it-gpu.litertlm"
+            ModelKind.ARTISAN -> "Gemma 4 E2B Artisan/HW package"
+            ModelKind.UNKNOWN -> MODEL_FILE_NAME
+        }
+    }
+
+    private fun currentModelKind(): ModelKind =
+        if (!modelFile.exists()) ModelKind.UNKNOWN else classifyModel(activeModelDisplayName(), modelFile.length())
+
+    private fun classifyModel(name: String?, bytes: Long): ModelKind {
+        val lower = name.orEmpty().lowercase(Locale.US)
+        if ("e2b-hw" in lower || "artisan" in lower) return ModelKind.ARTISAN
+        if ("e2b-it-gpu" in lower || nearSize(bytes, GPU_MODEL_BYTES)) return ModelKind.GPU_OPT
+        if (nearSize(bytes, GENERIC_MODEL_BYTES)) return ModelKind.GENERIC
+        return ModelKind.UNKNOWN
+    }
+
+    private fun nearSize(actual: Long, expected: Long): Boolean =
+        kotlin.math.abs(actual - expected) <= SIZE_TOLERANCE_BYTES
+
+    private fun modelKindLabel(kind: ModelKind): String = when (kind) {
+        ModelKind.GENERIC -> "GENERIC GPU/CPU"
+        ModelKind.GPU_OPT -> "DEDICATED GPU"
+        ModelKind.ARTISAN -> "GPU ARTISAN/HW"
+        ModelKind.UNKNOWN -> "UNKNOWN"
+    }
+
+    private fun showPackageHint(overwrite: Boolean) {
+        if (!modelFile.exists()) return
+        val text = when (currentModelKind()) {
+            ModelKind.GPU_OPT ->
+                "DEDICATED GPU package detected.\n" +
+                    "Use LOAD GPU + MTP and MTP A/B ×3. This is the fastest public E2B package path SpeedLab currently targets.\n" +
+                    "Artisan SYNC tuning is intentionally disabled because the public -gpu package uses the regular GPU backend.\n"
+
+            ModelKind.GENERIC ->
+                "GENERIC E2B package detected.\n" +
+                    "GPU + MTP is supported. For the next speed test, select gemma-4-E2B-it-gpu.litertlm instead.\n" +
+                    "Artisan SYNC tuning is intentionally disabled for this package.\n"
+
+            ModelKind.ARTISAN ->
+                "GPU ARTISAN/HW package detected. Artisan SYNC 1/2/4/8 sweep is enabled.\n"
+
+            ModelKind.UNKNOWN ->
+                "Unknown E2B package. Normal Backend.GPU() loading is allowed, but Artisan-only tuning stays disabled unless the package is explicitly identified as an Artisan/HW model.\n"
+        }
+        if (overwrite) outputText.text = text else outputText.append(text)
+    }
+
+    private fun artisanUnavailableMessage(): String =
+        "ARTISAN SWEEP NOT AVAILABLE FOR THIS PACKAGE\n\n" +
+            "Current package: ${modelKindLabel(currentModelKind())} • ${activeModelDisplayName()}\n\n" +
+            "LiteRT-LM's num_decode_steps_per_sync setting is currently supported only by the GPU_ARTISAN backend. " +
+            "The public gemma-4-E2B-it.litertlm and gemma-4-E2B-it-gpu.litertlm packages are used through Backend.GPU(), " +
+            "so SpeedLab will not force them through GPU_ARTISAN and crash the child process.\n\n" +
+            "Use MTP A/B ×3 for this model.\n"
+
     private fun refreshModelState() {
         if (modelFile.exists()) {
-            modelText.text = "MODEL  ${formatGiB(modelFile.length())} GiB  •  $MODEL_FILE_NAME"
-            if (!speedLab.isLoaded) statusText.text = "STATUS  MODEL READY"
+            modelText.text =
+                "MODEL  ${formatGiB(modelFile.length())} GiB  •  ${modelKindLabel(currentModelKind())}\n" +
+                    activeModelDisplayName()
+            if (!speedLab.isLoaded && !busy) statusText.text = "STATUS  MODEL READY"
         } else {
             modelText.text = "MODEL  NONE"
             statusText.text = "STATUS  SELECT E2B MODEL"
@@ -518,7 +644,12 @@ class MainActivity : Activity() {
         loadButton.isEnabled = !busy && modelFile.exists()
         generateButton.isEnabled = !busy && speedLab.isLoaded
         benchmarkButton.isEnabled = !busy && modelFile.exists()
-        extremeButton.isEnabled = !busy && modelFile.exists()
+        extremeButton.isEnabled = !busy && modelFile.exists() && currentModelKind() == ModelKind.ARTISAN
+        extremeButton.text = if (currentModelKind() == ModelKind.ARTISAN) {
+            "ARTISAN SWEEP  •  GPU SYNC 1 / 2 / 4 / 8"
+        } else {
+            "ARTISAN SYNC SWEEP  •  HW MODEL ONLY"
+        }
         resetButton.isEnabled = !busy && speedLab.isLoaded
     }
 
