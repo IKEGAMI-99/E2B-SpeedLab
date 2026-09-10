@@ -2,6 +2,7 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
     <application
+        android:name=".SpeedLabApplication"
         android:allowBackup="false"
         android:hardwareAccelerated="true"
         android:label="E2B SpeedLab"
@@ -14,6 +15,11 @@
         <uses-native-library
             android:name="libOpenCL.so"
             android:required="false" />
+
+        <service
+            android:name=".ExtremeBenchmarkService"
+            android:exported="false"
+            android:process=":extreme" />
 
         <activity
             android:name=".MainActivity"
