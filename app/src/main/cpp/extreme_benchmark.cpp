@@ -72,10 +72,14 @@ T load_symbol(void* lib, const char* name, bool required = true) {
 
 Api load_api() {
   Api a;
-  a.lib = dlopen("liblitertlm_jni.so", RTLD_NOW | RTLD_LOCAL);
+
+  // IMPORTANT: the Maven SDK's liblitertlm_jni.so intentionally exports only JNI entry points.
+  // v0.1.5 incorrectly tried to dlsym the public C API from that library.  The Extreme build now
+  // packages LiteRT-LM's dedicated C API shared library (//c:litert-lm) alongside the Maven SDK.
+  a.lib = dlopen("liblitert-lm.so", RTLD_NOW | RTLD_LOCAL);
   if (!a.lib) {
     const char* error = dlerror();
-    throw std::runtime_error(std::string("Could not open liblitertlm_jni.so: ") +
+    throw std::runtime_error(std::string("Could not open bundled liblitert-lm.so: ") +
                              (error ? error : "unknown dlopen error"));
   }
 
@@ -88,7 +92,6 @@ Api load_api() {
   a.settings_set_cache_dir = load_symbol<Api::SetString>(a.lib, "litert_lm_engine_settings_set_cache_dir");
   a.settings_set_speculative = load_symbol<Api::SetBool>(a.lib, "litert_lm_engine_settings_set_enable_speculative_decoding");
   a.settings_set_gpu_decode_steps = load_symbol<Api::SetInt>(a.lib, "litert_lm_engine_settings_set_gpu_decode_steps_per_sync");
-  // Older builds may not expose this helper. It improves benchmark correctness but is not required.
   a.settings_set_gpu_wait_weights = load_symbol<Api::SetBool>(a.lib, "litert_lm_engine_settings_set_gpu_wait_for_weight_uploads", false);
 
   a.engine_create = load_symbol<Api::EngineCreate>(a.lib, "litert_lm_engine_create");
@@ -175,7 +178,6 @@ Java_com_e2bspeedlab_ExtremeNative_nativeBenchmark(
     session = api.engine_create_session(engine, nullptr);
     if (!session) throw std::runtime_error("LiteRT-LM failed to create benchmark session");
 
-    // Benchmark mode pads/truncates this to the configured 512-token prefill target.
     static constexpr char kPrompt[] =
         "On-device language models benefit from low latency, efficient memory use, "
         "fast token generation, and predictable performance. Explain the performance "
