@@ -10,8 +10,8 @@ android {
         applicationId = "com.e2bspeedlab"
         minSdk = 31
         targetSdk = 37
-        versionCode = 7
-        versionName = "0.1.6"
+        versionCode = 8
+        versionName = "0.1.7"
 
         // SpeedLab is intentionally ARM64-only. The target devices are modern Android flagships,
         // and keeping one ABI avoids carrying dead native binaries in a speed-focused lab app.
