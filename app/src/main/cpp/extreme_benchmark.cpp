@@ -3,6 +3,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <fstream>
 #include <stdexcept>
 #include <string>
 
@@ -35,7 +36,6 @@ struct Api {
   SetString settings_set_cache_dir = nullptr;
   SetBool settings_set_speculative = nullptr;
   SetInt settings_set_gpu_decode_steps = nullptr;
-  SetBool settings_set_gpu_wait_weights = nullptr;
 
   EngineCreate engine_create = nullptr;
   VoidPtr engine_delete = nullptr;
@@ -72,10 +72,6 @@ T load_symbol(void* lib, const char* name, bool required = true) {
 
 Api load_api() {
   Api a;
-
-  // IMPORTANT: the Maven SDK's liblitertlm_jni.so intentionally exports only JNI entry points.
-  // v0.1.5 incorrectly tried to dlsym the public C API from that library.  The Extreme build now
-  // packages LiteRT-LM's dedicated C API shared library (//c:litert-lm) alongside the Maven SDK.
   a.lib = dlopen("liblitert-lm.so", RTLD_NOW | RTLD_LOCAL);
   if (!a.lib) {
     const char* error = dlerror();
@@ -92,7 +88,6 @@ Api load_api() {
   a.settings_set_cache_dir = load_symbol<Api::SetString>(a.lib, "litert_lm_engine_settings_set_cache_dir");
   a.settings_set_speculative = load_symbol<Api::SetBool>(a.lib, "litert_lm_engine_settings_set_enable_speculative_decoding");
   a.settings_set_gpu_decode_steps = load_symbol<Api::SetInt>(a.lib, "litert_lm_engine_settings_set_gpu_decode_steps_per_sync");
-  a.settings_set_gpu_wait_weights = load_symbol<Api::SetBool>(a.lib, "litert_lm_engine_settings_set_gpu_wait_for_weight_uploads", false);
 
   a.engine_create = load_symbol<Api::EngineCreate>(a.lib, "litert_lm_engine_create");
   a.engine_delete = load_symbol<Api::VoidPtr>(a.lib, "litert_lm_engine_delete");
@@ -130,6 +125,15 @@ void throw_java(JNIEnv* env, const std::string& message) {
   if (cls) env->ThrowNew(cls, message.c_str());
 }
 
+void write_stage(const std::string& cache_dir, const char* stage) {
+  if (cache_dir.empty()) return;
+  std::ofstream out(cache_dir + "/extreme_stage.txt", std::ios::out | std::ios::trunc);
+  if (out) {
+    out << stage;
+    out.flush();
+  }
+}
+
 }  // namespace
 
 extern "C" JNIEXPORT jdoubleArray JNICALL
@@ -147,6 +151,7 @@ Java_com_e2bspeedlab_ExtremeNative_nativeBenchmark(
   void* input = nullptr;
   void* responses = nullptr;
   void* info = nullptr;
+  std::string cache_dir;
 
   try {
     if (decode_steps_per_sync < 1 || decode_steps_per_sync > 32) {
@@ -154,12 +159,18 @@ Java_com_e2bspeedlab_ExtremeNative_nativeBenchmark(
     }
 
     const std::string model_path = jstring_to_utf8(env, model_path_j);
-    const std::string cache_dir = jstring_to_utf8(env, cache_dir_j);
+    cache_dir = jstring_to_utf8(env, cache_dir_j);
     if (model_path.empty()) throw std::runtime_error("Model path is empty");
 
+    write_stage(cache_dir, "LOAD_C_API");
     api = load_api();
-    settings = api.settings_create(model_path.c_str(), "gpu", nullptr, nullptr);
-    if (!settings) throw std::runtime_error("LiteRT-LM failed to create engine settings");
+
+    // num_decode_steps_per_sync is explicitly an Artisan-only LiteRT-LM setting.
+    // Using the generic "gpu" backend here made the Extreme path exercise the wrong
+    // executor while applying Artisan-only tuning knobs, which could stall indefinitely.
+    write_stage(cache_dir, "CREATE_SETTINGS_GPU_ARTISAN");
+    settings = api.settings_create(model_path.c_str(), "gpu_artisan", nullptr, nullptr);
+    if (!settings) throw std::runtime_error("LiteRT-LM failed to create Artisan GPU engine settings");
 
     api.settings_enable_benchmark(settings);
     api.settings_set_max_num_tokens(settings, 2048);
@@ -168,13 +179,17 @@ Java_com_e2bspeedlab_ExtremeNative_nativeBenchmark(
     if (!cache_dir.empty()) api.settings_set_cache_dir(settings, cache_dir.c_str());
     api.settings_set_speculative(settings, enable_mtp == JNI_TRUE);
     api.settings_set_gpu_decode_steps(settings, decode_steps_per_sync);
-    if (api.settings_set_gpu_wait_weights) api.settings_set_gpu_wait_weights(settings, true);
 
+    // Keep wait_for_weight_uploads at the upstream default (false). Forcing it true is
+    // unnecessary for this benchmark and can turn driver-side async upload problems into
+    // an apparent initialization hang on mobile GPUs.
+    write_stage(cache_dir, "ENGINE_CREATE");
     engine = api.engine_create(settings);
     api.settings_delete(settings);
     settings = nullptr;
-    if (!engine) throw std::runtime_error("LiteRT-LM failed to create Extreme GPU engine");
+    if (!engine) throw std::runtime_error("LiteRT-LM failed to create Extreme Artisan GPU engine");
 
+    write_stage(cache_dir, "SESSION_CREATE");
     session = api.engine_create_session(engine, nullptr);
     if (!session) throw std::runtime_error("LiteRT-LM failed to create benchmark session");
 
@@ -182,11 +197,14 @@ Java_com_e2bspeedlab_ExtremeNative_nativeBenchmark(
         "On-device language models benefit from low latency, efficient memory use, "
         "fast token generation, and predictable performance. Explain the performance "
         "tradeoffs of mobile inference and continue with enough detail for benchmarking.";
+    write_stage(cache_dir, "INPUT_CREATE");
     input = api.input_create(0 /* kLiteRtLmInputDataTypeText */, kPrompt, sizeof(kPrompt) - 1);
     if (!input) throw std::runtime_error("LiteRT-LM failed to create benchmark input");
 
     const void* inputs[1] = {input};
+    write_stage(cache_dir, "GENERATE");
     responses = api.session_generate(session, inputs, 1);
+    write_stage(cache_dir, "GENERATE_DONE");
     if (responses) {
       api.responses_delete(responses);
       responses = nullptr;
@@ -194,6 +212,7 @@ Java_com_e2bspeedlab_ExtremeNative_nativeBenchmark(
     api.input_delete(input);
     input = nullptr;
 
+    write_stage(cache_dir, "BENCHMARK_INFO");
     info = api.session_get_benchmark_info(session);
     if (!info) throw std::runtime_error("LiteRT-LM returned no Extreme benchmark info");
 
@@ -219,12 +238,14 @@ Java_com_e2bspeedlab_ExtremeNative_nativeBenchmark(
     engine = nullptr;
     dlclose(api.lib);
     api.lib = nullptr;
+    write_stage(cache_dir, "DONE");
 
     jdoubleArray result = env->NewDoubleArray(6);
     if (!result) throw std::runtime_error("Could not allocate benchmark result array");
     env->SetDoubleArrayRegion(result, 0, 6, values);
     return result;
   } catch (const std::exception& e) {
+    write_stage(cache_dir, (std::string("ERROR: ") + e.what()).c_str());
     if (info && api.benchmark_info_delete) api.benchmark_info_delete(info);
     if (responses && api.responses_delete) api.responses_delete(responses);
     if (input && api.input_delete) api.input_delete(input);
