@@ -10,11 +10,9 @@ android {
         applicationId = "com.e2bspeedlab"
         minSdk = 31
         targetSdk = 37
-        versionCode = 10
-        versionName = "0.1.9"
+        versionCode = 11
+        versionName = "0.2.0"
 
-        // SpeedLab is intentionally ARM64-only. The target devices are modern Android flagships,
-        // and keeping one ABI avoids carrying dead native binaries in a speed-focused lab app.
         ndk {
             abiFilters += "arm64-v8a"
         }
@@ -63,9 +61,6 @@ configurations.configureEach {
 
 dependencies {
     implementation("com.google.ai.edge.litertlm:litertlm-android:0.17.0-alpha1")
-
-    // LiteRT-LM currently builds against coroutines 1.11.0. Keep both artifacts pinned to the
-    // same ABI so Conversation.sendMessageAsync() does not crash with SendChannel.close$default.
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core-jvm:1.11.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.11.0")
 }
