@@ -1,16 +1,13 @@
 package com.e2bspeedlab
 
 import android.app.Activity
-import android.content.Context
 import android.content.Intent
-import android.graphics.Canvas
 import android.graphics.Color
-import android.graphics.Paint
+import android.icu.text.BreakIterator
 import android.net.Uri
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
-import android.os.SystemClock
 import android.provider.OpenableColumns
 import android.text.Spannable
 import android.text.SpannableString
@@ -34,7 +31,6 @@ import java.io.File
 import java.io.FileOutputStream
 import java.util.ArrayDeque
 import java.util.Locale
-import android.icu.text.BreakIterator
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -43,9 +39,10 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 /**
- * Human-read optimized UI.
- * FLASH shows 1-4 RSVP units at a fixed gaze point; FLOW is a continuous marquee.
- * Each generation is intentionally stateless: the Conversation is recreated before START.
+ * Single-purpose rapid reader.
+ *
+ * Intentionally no conventional chat transcript, FLOW mode, multi-line mode, or line-gap controls.
+ * Every generation is stateless so the verified 1536-token Turbo context never fills across turns.
  */
 class ReadActivityV2 : Activity() {
 
@@ -57,17 +54,12 @@ class ReadActivityV2 : Activity() {
         private const val PREF_TURBO_CONTEXT = "turbo_context"
         private const val PREF_TURBO_FAST_CPUS = "turbo_fast_cpus"
         private const val PREF_TURBO_TPS = "turbo_tps"
-        private const val PREF_FLASH_LINES = "flash_lines"
-        private const val PREF_FLASH_LINE_GAP = "flash_line_gap_dp"
         private const val PREF_PACE = "read_pace"
 
         private const val VERIFIED_CONTEXT = 1536
         private const val VERIFIED_FAST_CPUS = 2
         private const val DEFAULT_PACE = 62
-        private const val DEFAULT_LINE_GAP_DP = 16
     }
-
-    private enum class DisplayMode { FLASH, FLOW }
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private lateinit var speedLab: SpeedLabEngine
@@ -76,43 +68,29 @@ class ReadActivityV2 : Activity() {
     private lateinit var root: LinearLayout
     private lateinit var statusText: TextView
     private lateinit var metricText: TextView
-    private lateinit var flashBoard: FlashBoard
-    private lateinit var flowView: FlowTextViewV2
+    private lateinit var flashText: TextView
     private lateinit var promptInput: EditText
-    private lateinit var flashButton: Button
-    private lateinit var flowButton: Button
     private lateinit var startButton: Button
     private lateinit var modelButton: Button
     private lateinit var pace: SeekBar
     private lateinit var paceText: TextView
-    private lateinit var lineGap: SeekBar
-    private lateinit var lineGapText: TextView
-    private lateinit var lineGapRow: LinearLayout
     private lateinit var progress: ProgressBar
-    private val lineButtons = ArrayList<Button>(4)
+    private lateinit var presenter: SingleFlashPresenter
 
-    private lateinit var flashPresenter: MultiLineFlashPresenter
-    private var mode = DisplayMode.FLASH
-    private var flashLines = 1
     private var busy = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         window.setDecorFitsSystemWindows(false)
+        window.statusBarColor = Color.rgb(8, 10, 14)
+        window.navigationBarColor = Color.rgb(8, 10, 14)
 
         modelFile = File(File(filesDir, "models").apply { mkdirs() }, MODEL_FILE_NAME)
         speedLab = SpeedLabEngine(File(cacheDir, "litertlm"))
-        flashLines = prefs().getInt(PREF_FLASH_LINES, 1).coerceIn(1, 4)
 
         buildUi()
         installInsets()
-        applyMode(DisplayMode.FLASH)
-        setFlashLines(flashLines, persist = false)
-
-        val savedGap = prefs().getInt(PREF_FLASH_LINE_GAP, DEFAULT_LINE_GAP_DP).coerceIn(0, 48)
-        lineGap.progress = savedGap
-        updateLineGap(savedGap, persist = false)
 
         val savedPace = prefs().getInt(PREF_PACE, DEFAULT_PACE).coerceIn(0, 100)
         pace.progress = savedPace
@@ -138,6 +116,7 @@ class ReadActivityV2 : Activity() {
             textSize = 24f
             setTextColor(Color.WHITE)
             typeface = android.graphics.Typeface.DEFAULT_BOLD
+            includeFontPadding = false
             maxLines = 1
         })
         titleColumn.addView(TextView(this).apply {
@@ -145,6 +124,7 @@ class ReadActivityV2 : Activity() {
             textSize = 10f
             letterSpacing = 0.12f
             setTextColor(Color.rgb(125, 138, 154))
+            includeFontPadding = false
             maxLines = 1
         })
         modelButton = compactButton("MODEL") { selectModel() }
@@ -155,7 +135,7 @@ class ReadActivityV2 : Activity() {
         val infoRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(0, dp(10), 0, dp(8))
+            setPadding(0, dp(12), 0, dp(8))
         }
         statusText = TextView(this).apply {
             text = "NO MODEL"
@@ -164,14 +144,13 @@ class ReadActivityV2 : Activity() {
             maxLines = 2
         }
         metricText = TextView(this).apply {
-            text = ""
             textSize = 11f
             gravity = Gravity.END
             setTextColor(Color.rgb(125, 226, 190))
-            maxLines = 1
+            setSingleLine(true)
         }
         infoRow.addView(statusText, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
-        infoRow.addView(metricText, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        infoRow.addView(metricText, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 0.75f))
         root.addView(infoRow)
 
         progress = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
@@ -183,100 +162,44 @@ class ReadActivityV2 : Activity() {
         val displayFrame = FrameLayout(this).apply {
             setBackgroundColor(Color.rgb(12, 15, 20))
         }
-        flashBoard = FlashBoard(this)
-        flowView = FlowTextViewV2(this).apply { visibility = View.GONE }
-        displayFrame.addView(flashBoard, FrameLayout.LayoutParams(
-            FrameLayout.LayoutParams.MATCH_PARENT,
-            FrameLayout.LayoutParams.MATCH_PARENT,
-        ))
-        displayFrame.addView(flowView, FrameLayout.LayoutParams(
-            FrameLayout.LayoutParams.MATCH_PARENT,
-            FrameLayout.LayoutParams.MATCH_PARENT,
-        ))
-        root.addView(displayFrame, LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT,
-            0,
-            1f,
-        ).apply {
-            topMargin = dp(8)
-            bottomMargin = dp(10)
-        })
+        flashText = TextView(this).apply {
+            gravity = Gravity.CENTER
+            setTextColor(Color.WHITE)
+            setSingleLine(true)
+            maxLines = 1
+            includeFontPadding = false
+            setHorizontallyScrolling(false)
+            setPadding(dp(20), dp(20), dp(20), dp(20))
+            typeface = android.graphics.Typeface.create(android.graphics.Typeface.SANS_SERIF, android.graphics.Typeface.NORMAL)
+            setAutoSizeTextTypeUniformWithConfiguration(18, 68, 1, TypedValue.COMPLEX_UNIT_SP)
+            text = "READY"
+        }
+        displayFrame.addView(
+            flashText,
+            FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT,
+            )
+        )
+        root.addView(
+            displayFrame,
+            LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f).apply {
+                topMargin = dp(8)
+                bottomMargin = dp(12)
+            }
+        )
 
-        flashPresenter = MultiLineFlashPresenter(flashBoard, Color.rgb(120, 235, 195))
-
-        val modeRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-        }
-        flashButton = actionButton("FLASH") { applyMode(DisplayMode.FLASH) }
-        flowButton = actionButton("FLOW") { applyMode(DisplayMode.FLOW) }
-        modeRow.addView(flashButton, LinearLayout.LayoutParams(0, dp(48), 1f).apply { marginEnd = dp(5) })
-        modeRow.addView(flowButton, LinearLayout.LayoutParams(0, dp(48), 1f).apply { marginStart = dp(5) })
-        root.addView(modeRow)
-
-        val lineRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(0, dp(7), 0, 0)
-        }
-        lineRow.addView(TextView(this).apply {
-            text = "LINES"
-            textSize = 10f
-            letterSpacing = 0.12f
-            setTextColor(Color.rgb(125, 138, 154))
-            gravity = Gravity.CENTER_VERTICAL
-        }, LinearLayout.LayoutParams(dp(62), dp(38)))
-        for (n in 1..4) {
-            val button = compactButton(n.toString()) { setFlashLines(n) }
-            lineButtons += button
-            lineRow.addView(button, LinearLayout.LayoutParams(0, dp(38), 1f).apply {
-                marginStart = dp(3)
-                marginEnd = dp(3)
-            })
-        }
-        root.addView(lineRow)
-
-        lineGapRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(0, dp(1), 0, 0)
-        }
-        lineGapRow.addView(TextView(this).apply {
-            text = "LINE GAP"
-            textSize = 10f
-            letterSpacing = 0.08f
-            setTextColor(Color.rgb(125, 138, 154))
-            gravity = Gravity.CENTER_VERTICAL
-        }, LinearLayout.LayoutParams(dp(72), dp(34)))
-        lineGapText = TextView(this).apply {
-            textSize = 11f
-            setTextColor(Color.rgb(155, 164, 178))
-            gravity = Gravity.CENTER_VERTICAL or Gravity.END
-        }
-        lineGap = SeekBar(this).apply {
-            max = 48
-            progress = DEFAULT_LINE_GAP_DP
-            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-                override fun onProgressChanged(seekBar: SeekBar?, value: Int, fromUser: Boolean) {
-                    updateLineGap(value, persist = fromUser)
-                }
-                override fun onStartTrackingTouch(seekBar: SeekBar?) = Unit
-                override fun onStopTrackingTouch(seekBar: SeekBar?) = Unit
-            })
-        }
-        lineGapRow.addView(lineGap, LinearLayout.LayoutParams(0, dp(34), 1f))
-        lineGapRow.addView(lineGapText, LinearLayout.LayoutParams(dp(54), LinearLayout.LayoutParams.WRAP_CONTENT))
-        root.addView(lineGapRow)
+        presenter = SingleFlashPresenter(flashText, Color.rgb(120, 235, 195))
 
         val paceRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(0, dp(1), 0, dp(4))
+            setPadding(0, dp(3), 0, dp(5))
         }
         paceText = TextView(this).apply {
             textSize = 11f
             setTextColor(Color.rgb(155, 164, 178))
-            gravity = Gravity.CENTER_VERTICAL
+            gravity = Gravity.CENTER_VERTICAL or Gravity.END
         }
         pace = SeekBar(this).apply {
             max = 100
@@ -290,8 +213,15 @@ class ReadActivityV2 : Activity() {
                 override fun onStopTrackingTouch(seekBar: SeekBar?) = Unit
             })
         }
+        paceRow.addView(TextView(this).apply {
+            text = "PACE"
+            textSize = 10f
+            letterSpacing = 0.12f
+            setTextColor(Color.rgb(125, 138, 154))
+            gravity = Gravity.CENTER_VERTICAL
+        }, LinearLayout.LayoutParams(dp(56), dp(38)))
         paceRow.addView(pace, LinearLayout.LayoutParams(0, dp(38), 1f))
-        paceRow.addView(paceText, LinearLayout.LayoutParams(dp(150), LinearLayout.LayoutParams.WRAP_CONTENT))
+        paceRow.addView(paceText, LinearLayout.LayoutParams(dp(92), LinearLayout.LayoutParams.WRAP_CONTENT))
         root.addView(paceRow)
 
         promptInput = EditText(this).apply {
@@ -314,10 +244,12 @@ class ReadActivityV2 : Activity() {
         root.addView(promptInput)
 
         startButton = actionButton("START FLASH") { startGeneration() }
-        root.addView(startButton, LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT,
-            dp(54),
-        ).apply { topMargin = dp(10) })
+        root.addView(
+            startButton,
+            LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(54)).apply {
+                topMargin = dp(10)
+            }
+        )
 
         setContentView(root)
     }
@@ -336,55 +268,12 @@ class ReadActivityV2 : Activity() {
         root.requestApplyInsets()
     }
 
-    private fun setFlashLines(lines: Int, persist: Boolean = true) {
-        flashLines = lines.coerceIn(1, 4)
-        flashBoard.activeLines = flashLines
-        flashPresenter.lineCount = flashLines
-        lineButtons.forEachIndexed { index, button ->
-            val selected = index + 1 == flashLines
-            button.setTextColor(if (selected) Color.BLACK else Color.WHITE)
-            button.setBackgroundColor(if (selected) Color.rgb(125, 226, 190) else Color.rgb(50, 54, 61))
-        }
-        if (persist) prefs().edit().putInt(PREF_FLASH_LINES, flashLines).apply()
-        lineGap.isEnabled = flashLines > 1
-        lineGap.alpha = if (flashLines > 1) 1f else 0.35f
-        updatePace(pace.progress)
-    }
-
-    private fun updateLineGap(value: Int, persist: Boolean = true) {
-        val gapDp = value.coerceIn(0, 48)
-        flashBoard.lineGapPx = dp(gapDp)
-        lineGapText.text = "$gapDp dp"
-        if (persist) prefs().edit().putInt(PREF_FLASH_LINE_GAP, gapDp).apply()
-    }
-
-    private fun applyMode(newMode: DisplayMode) {
-        mode = newMode
-        val flash = newMode == DisplayMode.FLASH
-        flashBoard.visibility = if (flash) View.VISIBLE else View.GONE
-        flowView.visibility = if (flash) View.GONE else View.VISIBLE
-        flashButton.setTextColor(if (flash) Color.BLACK else Color.WHITE)
-        flashButton.setBackgroundColor(if (flash) Color.rgb(125, 226, 190) else Color.rgb(50, 54, 61))
-        flowButton.setTextColor(if (!flash) Color.BLACK else Color.WHITE)
-        flowButton.setBackgroundColor(if (!flash) Color.rgb(125, 226, 190) else Color.rgb(50, 54, 61))
-        startButton.text = if (flash) "START FLASH" else "START FLOW"
-        lineButtons.forEach { it.visibility = if (flash) View.VISIBLE else View.INVISIBLE }
-        lineGapRow.visibility = if (flash) View.VISIBLE else View.GONE
-        updatePace(pace.progress)
-    }
-
     private fun updatePace(value: Int) {
         val clamped = value.coerceIn(0, 100)
         val flashMs = (240 - clamped * 1.85).toLong().coerceAtLeast(55L)
-        val flowPx = 220f + clamped * 9f
-        flashPresenter.intervalMs = flashMs
-        flowView.speedPxPerSecond = flowPx * resources.displayMetrics.density
-        paceText.text = if (mode == DisplayMode.FLASH) {
-            val perLine = (60_000L / flashMs).coerceAtMost(1200L)
-            if (flashLines == 1) "$perLine WPM" else "$perLine WPM × $flashLines"
-        } else {
-            String.format(Locale.US, "%.1f× FLOW", 0.5 + clamped / 50.0)
-        }
+        presenter.intervalMs = flashMs
+        val wpm = (60_000L / flashMs).coerceAtMost(1200L)
+        paceText.text = "$wpm WPM"
     }
 
     private fun startGeneration() {
@@ -394,50 +283,31 @@ class ReadActivityV2 : Activity() {
         hideKeyboard()
         setBusy(true)
         metricText.text = "STREAMING"
+        presenter.begin()
 
-        val unitizer = StreamingReadUnitizer(Locale.getDefault())
-        if (mode == DisplayMode.FLASH) {
-            flowView.stopAndClear()
-            flashPresenter.begin()
-        } else {
-            flashPresenter.cancel()
-            flowView.begin()
-        }
+        val unitizer = KatakanaSafeUnitizer(Locale.getDefault())
 
         scope.launch {
             try {
-                // This product intentionally has no chat history. Recreating Conversation before
-                // every START prevents the 1536-token Turbo context from filling after ~3-4 turns.
+                // No visible chat history means there should be no hidden chat history either.
                 speedLab.resetConversation()
 
-                val visualPrompt = "$prompt\nAnswer in plain text. Do not use Markdown formatting."
+                val visualPrompt = "$prompt\nAnswer in plain text optimized for rapid one-word-at-a-time reading. " +
+                    "Do not use Markdown, headings, numbered lists, bullets, or tables. Use natural short sentences."
+
                 val info = speedLab.generate(visualPrompt) { chunk ->
-                    when (mode) {
-                        DisplayMode.FLASH -> {
-                            val units = unitizer.push(chunk)
-                            if (units.isNotEmpty()) flashPresenter.enqueue(units)
-                        }
-                        DisplayMode.FLOW -> {
-                            val clean = cleanFlowChunk(chunk)
-                            if (clean.isNotEmpty()) flowView.appendStreaming(clean)
-                        }
-                    }
+                    val units = unitizer.push(chunk)
+                    if (units.isNotEmpty()) presenter.enqueue(units)
                 }
 
-                if (mode == DisplayMode.FLASH) {
-                    flashPresenter.enqueue(unitizer.finish())
-                    flashPresenter.finishInput()
-                } else {
-                    flowView.finishInput()
-                }
+                presenter.enqueue(unitizer.finish())
+                presenter.finishInput()
                 showMetrics(info)
                 statusText.text = profileStatus("READY")
             } catch (t: Throwable) {
-                flashPresenter.cancel()
-                flowView.stopAndClear()
-                flashBoard.showStatus("ERROR")
+                presenter.cancel()
+                presenter.showStatic("ERROR")
                 statusText.text = "ERROR • ${t.message ?: t.javaClass.simpleName}"
-                // Make the next START recover from a partially failed native conversation too.
                 runCatching { speedLab.resetConversation() }
             } finally {
                 setBusy(false)
@@ -472,11 +342,11 @@ class ReadActivityV2 : Activity() {
                 } else {
                     String.format(Locale.US, "loaded %.1fs", seconds)
                 }
-                if (mode == DisplayMode.FLASH) flashBoard.showStatus("READY")
+                presenter.showStatic("READY")
             } catch (t: Throwable) {
                 statusText.text = "LOAD ERROR"
                 metricText.text = t.message ?: t.javaClass.simpleName
-                flashBoard.showStatus("LOAD FAILED")
+                presenter.showStatic("LOAD FAILED")
             } finally {
                 setBusy(false)
                 refreshState()
@@ -579,7 +449,7 @@ class ReadActivityV2 : Activity() {
         if (!modelFile.exists() && !busy) {
             statusText.text = "SELECT E2B MODEL"
             metricText.text = ""
-            flashBoard.showStatus("NO MODEL")
+            presenter.showStatic("NO MODEL")
         }
         updateControls()
     }
@@ -592,27 +462,15 @@ class ReadActivityV2 : Activity() {
 
     private fun updateControls() {
         startButton.isEnabled = !busy && speedLab.isLoaded
-        flashButton.isEnabled = !busy
-        flowButton.isEnabled = !busy
         modelButton.isEnabled = !busy
         promptInput.isEnabled = !busy
         pace.isEnabled = !busy
-        lineGap.isEnabled = flashLines > 1
-        lineGap.alpha = if (flashLines > 1) 1f else 0.35f
-        // Line count and visual spacing are display-only and remain adjustable while output plays.
-        lineButtons.forEach { it.isEnabled = true }
     }
 
     private fun activeModelDisplayName(): String =
         prefs().getString(MODEL_NAME_PREF, null)?.takeIf { it.isNotBlank() } ?: MODEL_FILE_NAME
 
     private fun prefs() = getSharedPreferences("speedlab", MODE_PRIVATE)
-
-    private fun cleanFlowChunk(chunk: String): String = chunk
-        .replace("**", "")
-        .replace("__", "")
-        .replace("`", "")
-        .replace("\n", "   •   ")
 
     private fun hideKeyboard() {
         (getSystemService(INPUT_METHOD_SERVICE) as InputMethodManager)
@@ -639,101 +497,22 @@ class ReadActivityV2 : Activity() {
     private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
 
     override fun onDestroy() {
-        flashPresenter.cancel()
-        flowView.stopAndClear()
+        presenter.cancel()
         speedLab.close()
         scope.cancel()
         super.onDestroy()
     }
 }
 
-/** Four physical single-line TextViews guarantee that a unit never wraps accidentally. */
-private class FlashBoard(context: Context) : LinearLayout(context) {
-    private val cells = ArrayList<TextView>(4)
-    private val cellHeightPx = dp(72)
-
-    var lineGapPx: Int = dp(16)
-        set(value) {
-            field = value.coerceAtLeast(0)
-            updateCellLayout()
-        }
-
-    var activeLines: Int = 1
-        set(value) {
-            field = value.coerceIn(1, 4)
-            cells.forEachIndexed { index, cell ->
-                cell.visibility = if (index < field) View.VISIBLE else View.GONE
-            }
-            updateCellLayout()
-        }
-
-    init {
-        orientation = VERTICAL
-        gravity = Gravity.CENTER
-        setBackgroundColor(Color.rgb(12, 15, 20))
-        repeat(4) {
-            val cell = TextView(context).apply {
-                gravity = Gravity.CENTER
-                setTextColor(Color.WHITE)
-                setSingleLine(true)
-                maxLines = 1
-                includeFontPadding = false
-                setPadding(dp(16), 0, dp(16), 0)
-                typeface = android.graphics.Typeface.create(android.graphics.Typeface.SANS_SERIF, android.graphics.Typeface.NORMAL)
-                setAutoSizeTextTypeUniformWithConfiguration(18, 54, 1, TypedValue.COMPLEX_UNIT_SP)
-                visibility = if (it == 0) View.VISIBLE else View.GONE
-            }
-            cells += cell
-            addView(cell, LayoutParams(LayoutParams.MATCH_PARENT, cellHeightPx))
-        }
-        updateCellLayout()
-    }
-
-    private fun updateCellLayout() {
-        cells.forEachIndexed { index, cell ->
-            val params = (cell.layoutParams as? LayoutParams) ?: LayoutParams(LayoutParams.MATCH_PARENT, cellHeightPx)
-            params.width = LayoutParams.MATCH_PARENT
-            params.height = cellHeightPx
-            params.weight = 0f
-            params.topMargin = if (index in 1 until activeLines) lineGapPx else 0
-            params.bottomMargin = 0
-            cell.layoutParams = params
-        }
-        requestLayout()
-    }
-
-    fun showUnits(units: List<String>, accentColor: Int) {
-        for (i in 0 until activeLines) {
-            val unit = units.getOrNull(i).orEmpty()
-            cells[i].text = if (unit.isEmpty()) "" else accented(unit, accentColor)
-        }
-    }
-
-    fun showStatus(text: String) {
-        cells.forEach { it.text = "" }
-        val index = ((activeLines - 1) / 2).coerceIn(0, 3)
-        cells[index].text = text
-    }
-
-    private fun accented(text: String, accentColor: Int): CharSequence {
-        val count = text.codePointCount(0, text.length)
-        if (count < 2) return text
-        val cpIndex = (count - 1) / 2
-        val start = text.offsetByCodePoints(0, cpIndex)
-        val end = text.offsetByCodePoints(start, 1)
-        return SpannableString(text).apply {
-            setSpan(ForegroundColorSpan(accentColor), start, end, Spannable.SPAN_EXCLUSIVE_EXCLUSIVE)
-        }
-    }
-
-    private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
-}
-
 /**
- * Streaming word/phrase segmenter tuned for RSVP rather than linguistic purity.
- * It holds one unit back so punctuation, hyphens and short Japanese particles can attach naturally.
+ * Streaming word segmenter tuned for one-line RSVP.
+ *
+ * ICU can expose boundaries inside katakana compounds depending on dictionary/stream boundaries.
+ * Adjacent katakana fragments are therefore coalesced before anything is emitted. The last lexical
+ * unit is always held back until a following boundary arrives, which also protects words split
+ * across model streaming chunks.
  */
-private class StreamingReadUnitizer(private val locale: Locale) {
+private class KatakanaSafeUnitizer(private val locale: Locale) {
     private val pending = StringBuilder()
     private var carry: String? = null
     private var joinNext = false
@@ -765,6 +544,7 @@ private class StreamingReadUnitizer(private val locale: Locale) {
                 end = iterator.next()
             }
 
+            // Keep the last segment buffered because a streamed model chunk may end mid-word.
             val count = if (final) segments.size else (segments.size - 1).coerceAtLeast(0)
             var cut = 0
             for (i in 0 until count) {
@@ -806,6 +586,12 @@ private class StreamingReadUnitizer(private val locale: Locale) {
             return
         }
 
+        // The key fix: ICU/stream boundaries must never split a katakana lexical run into flashes.
+        if (carry != null && isKatakanaRun(carry!!) && isKatakanaRun(segment)) {
+            carry += segment
+            return
+        }
+
         if (segment in japaneseParticles && carry != null) {
             carry += segment
             return
@@ -822,15 +608,37 @@ private class StreamingReadUnitizer(private val locale: Locale) {
         .replace("\n", " ")
         .trim()
 
-    private fun isJoiner(s: String): Boolean = s in setOf("-", "‐", "‑", "–", "'", "’")
+    private fun isJoiner(s: String): Boolean = s in setOf("-", "‐", "‑", "–", "'", "’", "・")
+
+    private fun isKatakanaRun(s: String): Boolean {
+        if (s.isEmpty()) return false
+        var i = 0
+        var sawKatakana = false
+        while (i < s.length) {
+            val cp = s.codePointAt(i)
+            val valid = when {
+                cp in 0x30A0..0x30FF -> true // Katakana, middle dot, prolonged sound mark
+                cp in 0x31F0..0x31FF -> true // Katakana phonetic extensions
+                cp in 0xFF65..0xFF9F -> true // Half-width katakana
+                cp == 0x3099 || cp == 0x309A -> true // combining voiced/semi-voiced marks
+                else -> false
+            }
+            if (!valid) return false
+            if (cp in 0x30A1..0x30FA || cp in 0x31F0..0x31FF || cp in 0xFF66..0xFF9D) {
+                sawKatakana = true
+            }
+            i += Character.charCount(cp)
+        }
+        return sawKatakana
+    }
 
     private fun isPunctuationOnly(s: String): Boolean = s.isNotEmpty() && s.all { ch ->
         !ch.isLetterOrDigit() && !Character.isIdeographic(ch.code) && !ch.isWhitespace() && !isJoiner(ch.toString())
     }
 }
 
-private class MultiLineFlashPresenter(
-    private val board: FlashBoard,
+private class SingleFlashPresenter(
+    private val view: TextView,
     private val accentColor: Int,
 ) {
     private val handler = Handler(Looper.getMainLooper())
@@ -839,26 +647,21 @@ private class MultiLineFlashPresenter(
     private var accepting = false
 
     var intervalMs: Long = 120L
-    var lineCount: Int = 1
-        set(value) {
-            field = value.coerceIn(1, 4)
-            board.activeLines = field
-        }
 
     fun begin() {
         handler.post {
+            handler.removeCallbacksAndMessages(null)
             queue.clear()
             accepting = true
             scheduled = false
-            handler.removeCallbacksAndMessages(null)
-            board.showStatus("•")
+            showStatic("•")
         }
     }
 
     fun enqueue(units: List<String>) {
         if (units.isEmpty()) return
         handler.post {
-            units.forEach(queue::addLast)
+            units.filter { it.isNotBlank() }.forEach(queue::addLast)
             if (!scheduled) step()
         }
     }
@@ -866,7 +669,7 @@ private class MultiLineFlashPresenter(
     fun finishInput() {
         handler.post {
             accepting = false
-            if (!scheduled && queue.isEmpty()) board.showStatus("✓")
+            if (!scheduled && queue.isEmpty()) showStatic("✓")
         }
     }
 
@@ -879,120 +682,42 @@ private class MultiLineFlashPresenter(
         }
     }
 
+    fun showStatic(text: String) {
+        view.text = text
+    }
+
     private fun step() {
-        if (queue.isEmpty()) {
+        val unit = queue.pollFirst()
+        if (unit == null) {
             scheduled = false
-            if (!accepting) board.showStatus("✓")
+            if (!accepting) showStatic("✓")
             return
         }
 
-        val frame = ArrayList<String>(lineCount)
-        repeat(lineCount) {
-            queue.pollFirst()?.let(frame::add)
-        }
         scheduled = true
-        board.showUnits(frame, accentColor)
-        handler.postDelayed({ step() }, dwellFor(frame))
+        view.text = accented(unit)
+        val delay = displayDelay(unit)
+        handler.postDelayed({ step() }, delay)
     }
 
-    private fun dwellFor(frame: List<String>): Long {
-        val longest = frame.maxOfOrNull { it.codePointCount(0, it.length) } ?: 1
-        val punctuation = frame.any { unit ->
-            val last = unit.lastOrNull()
-            last != null && last in charArrayOf('.', '!', '?', '。', '！', '？')
+    private fun displayDelay(unit: String): Long {
+        val cp = unit.codePointCount(0, unit.length)
+        var multiplier = 1.0
+        if (cp >= 10) multiplier += 0.18
+        if (cp >= 16) multiplier += 0.16
+        if (unit.lastOrNull() in setOf('。', '！', '？', '.', '!', '?')) multiplier += 0.35
+        else if (unit.lastOrNull() in setOf('、', ',', ';', ':')) multiplier += 0.14
+        return (intervalMs * multiplier).toLong().coerceAtLeast(45L)
+    }
+
+    private fun accented(text: String): CharSequence {
+        val count = text.codePointCount(0, text.length)
+        if (count < 2) return text
+        val cpIndex = (count - 1) / 2
+        val start = text.offsetByCodePoints(0, cpIndex)
+        val end = text.offsetByCodePoints(start, 1)
+        return SpannableString(text).apply {
+            setSpan(ForegroundColorSpan(accentColor), start, end, Spannable.SPAN_EXCLUSIVE_EXCLUSIVE)
         }
-        val lengthBonus = when {
-            longest >= 12 -> 1.35
-            longest >= 8 -> 1.18
-            else -> 1.0
-        }
-        val punctuationBonus = if (punctuation) 1.35 else 1.0
-        // More simultaneous lines need a little extra dwell, but still increase net reading throughput.
-        val lineBonus = 1.0 + (lineCount - 1) * 0.16
-        return (intervalMs * lengthBonus * punctuationBonus * lineBonus).toLong()
-    }
-}
-
-/** Streaming single-line marquee. */
-private class FlowTextViewV2(context: Context) : View(context) {
-    private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.WHITE
-        textSize = 42f * resources.displayMetrics.scaledDensity
-        typeface = android.graphics.Typeface.create(android.graphics.Typeface.SANS_SERIF, android.graphics.Typeface.BOLD)
-    }
-    private val text = StringBuilder()
-    private var offsetX = 0f
-    private var lastFrameMs = 0L
-    private var running = false
-    private var inputFinished = false
-
-    var speedPxPerSecond: Float = 720f
-
-    private val frame = object : Runnable {
-        override fun run() {
-            if (!running) return
-            val now = SystemClock.uptimeMillis()
-            if (lastFrameMs == 0L) lastFrameMs = now
-            val dt = ((now - lastFrameMs).coerceAtMost(50L)) / 1000f
-            lastFrameMs = now
-            if (text.isNotEmpty()) offsetX -= speedPxPerSecond * dt
-            invalidate()
-
-            val widthPx = paint.measureText(text.toString())
-            if (inputFinished && text.isNotEmpty() && offsetX + widthPx < -24f) {
-                running = false
-            } else {
-                postOnAnimation(this)
-            }
-        }
-    }
-
-    fun begin() {
-        post {
-            removeCallbacks(frame)
-            text.clear()
-            offsetX = width.toFloat().coerceAtLeast(1f)
-            lastFrameMs = 0L
-            running = true
-            inputFinished = false
-            postOnAnimation(frame)
-            invalidate()
-        }
-    }
-
-    fun appendStreaming(chunk: String) {
-        if (chunk.isEmpty()) return
-        post {
-            if (!running) {
-                running = true
-                inputFinished = false
-                offsetX = width.toFloat().coerceAtLeast(1f)
-                lastFrameMs = 0L
-                postOnAnimation(frame)
-            }
-            text.append(chunk)
-            invalidate()
-        }
-    }
-
-    fun finishInput() {
-        post { inputFinished = true }
-    }
-
-    fun stopAndClear() {
-        post {
-            running = false
-            inputFinished = true
-            removeCallbacks(frame)
-            text.clear()
-            invalidate()
-        }
-    }
-
-    override fun onDraw(canvas: Canvas) {
-        super.onDraw(canvas)
-        if (text.isEmpty()) return
-        val baseline = height / 2f - (paint.ascent() + paint.descent()) / 2f
-        canvas.drawText(text.toString(), offsetX, baseline, paint)
     }
 }
