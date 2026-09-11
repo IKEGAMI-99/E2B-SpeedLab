@@ -41,11 +41,11 @@ class HomeActivity : Activity() {
         root.addView(modeButton("AI FLASH\nGemma 4 E2B", ReadActivityV4::class.java), LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(92)).apply {
             topMargin = dp(28)
         })
-        root.addView(modeButton("AOZORA BOOK\n青空文庫を直接検索・高速表示", AozoraBookActivity::class.java), LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(92)).apply {
+        root.addView(modeButton("AOZORA BOOK\n原文 / AI 70% / 40% / 20% 圧縮", AozoraBookActivityV2::class.java), LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(92)).apply {
             topMargin = dp(12)
         })
         root.addView(TextView(this).apply {
-            text = "BOOKは青空文庫の公式公開データを直接使用"
+            text = "BOOKは青空文庫の公式公開データを直接使用 • AI圧縮は端末内E2B"
             textSize = 11f
             setTextColor(Color.rgb(110, 123, 138))
             gravity = Gravity.CENTER
