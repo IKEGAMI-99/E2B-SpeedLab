@@ -58,11 +58,13 @@ class ReadActivityV2 : Activity() {
         private const val PREF_TURBO_FAST_CPUS = "turbo_fast_cpus"
         private const val PREF_TURBO_TPS = "turbo_tps"
         private const val PREF_FLASH_LINES = "flash_lines"
+        private const val PREF_FLASH_LINE_GAP = "flash_line_gap_dp"
         private const val PREF_PACE = "read_pace"
 
         private const val VERIFIED_CONTEXT = 1536
         private const val VERIFIED_FAST_CPUS = 2
         private const val DEFAULT_PACE = 62
+        private const val DEFAULT_LINE_GAP_DP = 16
     }
 
     private enum class DisplayMode { FLASH, FLOW }
@@ -83,6 +85,9 @@ class ReadActivityV2 : Activity() {
     private lateinit var modelButton: Button
     private lateinit var pace: SeekBar
     private lateinit var paceText: TextView
+    private lateinit var lineGap: SeekBar
+    private lateinit var lineGapText: TextView
+    private lateinit var lineGapRow: LinearLayout
     private lateinit var progress: ProgressBar
     private val lineButtons = ArrayList<Button>(4)
 
@@ -104,6 +109,11 @@ class ReadActivityV2 : Activity() {
         installInsets()
         applyMode(DisplayMode.FLASH)
         setFlashLines(flashLines, persist = false)
+
+        val savedGap = prefs().getInt(PREF_FLASH_LINE_GAP, DEFAULT_LINE_GAP_DP).coerceIn(0, 48)
+        lineGap.progress = savedGap
+        updateLineGap(savedGap, persist = false)
+
         val savedPace = prefs().getInt(PREF_PACE, DEFAULT_PACE).coerceIn(0, 100)
         pace.progress = savedPace
         updatePace(savedPace)
@@ -226,10 +236,42 @@ class ReadActivityV2 : Activity() {
         }
         root.addView(lineRow)
 
+        lineGapRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(1), 0, 0)
+        }
+        lineGapRow.addView(TextView(this).apply {
+            text = "LINE GAP"
+            textSize = 10f
+            letterSpacing = 0.08f
+            setTextColor(Color.rgb(125, 138, 154))
+            gravity = Gravity.CENTER_VERTICAL
+        }, LinearLayout.LayoutParams(dp(72), dp(34)))
+        lineGapText = TextView(this).apply {
+            textSize = 11f
+            setTextColor(Color.rgb(155, 164, 178))
+            gravity = Gravity.CENTER_VERTICAL or Gravity.END
+        }
+        lineGap = SeekBar(this).apply {
+            max = 48
+            progress = DEFAULT_LINE_GAP_DP
+            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(seekBar: SeekBar?, value: Int, fromUser: Boolean) {
+                    updateLineGap(value, persist = fromUser)
+                }
+                override fun onStartTrackingTouch(seekBar: SeekBar?) = Unit
+                override fun onStopTrackingTouch(seekBar: SeekBar?) = Unit
+            })
+        }
+        lineGapRow.addView(lineGap, LinearLayout.LayoutParams(0, dp(34), 1f))
+        lineGapRow.addView(lineGapText, LinearLayout.LayoutParams(dp(54), LinearLayout.LayoutParams.WRAP_CONTENT))
+        root.addView(lineGapRow)
+
         val paceRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(0, dp(3), 0, dp(4))
+            setPadding(0, dp(1), 0, dp(4))
         }
         paceText = TextView(this).apply {
             textSize = 11f
@@ -304,7 +346,16 @@ class ReadActivityV2 : Activity() {
             button.setBackgroundColor(if (selected) Color.rgb(125, 226, 190) else Color.rgb(50, 54, 61))
         }
         if (persist) prefs().edit().putInt(PREF_FLASH_LINES, flashLines).apply()
+        lineGap.isEnabled = flashLines > 1
+        lineGap.alpha = if (flashLines > 1) 1f else 0.35f
         updatePace(pace.progress)
+    }
+
+    private fun updateLineGap(value: Int, persist: Boolean = true) {
+        val gapDp = value.coerceIn(0, 48)
+        flashBoard.lineGapPx = dp(gapDp)
+        lineGapText.text = "$gapDp dp"
+        if (persist) prefs().edit().putInt(PREF_FLASH_LINE_GAP, gapDp).apply()
     }
 
     private fun applyMode(newMode: DisplayMode) {
@@ -318,6 +369,7 @@ class ReadActivityV2 : Activity() {
         flowButton.setBackgroundColor(if (!flash) Color.rgb(125, 226, 190) else Color.rgb(50, 54, 61))
         startButton.text = if (flash) "START FLASH" else "START FLOW"
         lineButtons.forEach { it.visibility = if (flash) View.VISIBLE else View.INVISIBLE }
+        lineGapRow.visibility = if (flash) View.VISIBLE else View.GONE
         updatePace(pace.progress)
     }
 
@@ -545,7 +597,9 @@ class ReadActivityV2 : Activity() {
         modelButton.isEnabled = !busy
         promptInput.isEnabled = !busy
         pace.isEnabled = !busy
-        // Line count is visual-only, so it remains adjustable while output is playing.
+        lineGap.isEnabled = flashLines > 1
+        lineGap.alpha = if (flashLines > 1) 1f else 0.35f
+        // Line count and visual spacing are display-only and remain adjustable while output plays.
         lineButtons.forEach { it.isEnabled = true }
     }
 
@@ -596,13 +650,21 @@ class ReadActivityV2 : Activity() {
 /** Four physical single-line TextViews guarantee that a unit never wraps accidentally. */
 private class FlashBoard(context: Context) : LinearLayout(context) {
     private val cells = ArrayList<TextView>(4)
+    private val cellHeightPx = dp(72)
+
+    var lineGapPx: Int = dp(16)
+        set(value) {
+            field = value.coerceAtLeast(0)
+            updateCellLayout()
+        }
+
     var activeLines: Int = 1
         set(value) {
             field = value.coerceIn(1, 4)
             cells.forEachIndexed { index, cell ->
                 cell.visibility = if (index < field) View.VISIBLE else View.GONE
             }
-            requestLayout()
+            updateCellLayout()
         }
 
     init {
@@ -622,8 +684,22 @@ private class FlashBoard(context: Context) : LinearLayout(context) {
                 visibility = if (it == 0) View.VISIBLE else View.GONE
             }
             cells += cell
-            addView(cell, LayoutParams(LayoutParams.MATCH_PARENT, 0, 1f))
+            addView(cell, LayoutParams(LayoutParams.MATCH_PARENT, cellHeightPx))
         }
+        updateCellLayout()
+    }
+
+    private fun updateCellLayout() {
+        cells.forEachIndexed { index, cell ->
+            val params = (cell.layoutParams as? LayoutParams) ?: LayoutParams(LayoutParams.MATCH_PARENT, cellHeightPx)
+            params.width = LayoutParams.MATCH_PARENT
+            params.height = cellHeightPx
+            params.weight = 0f
+            params.topMargin = if (index in 1 until activeLines) lineGapPx else 0
+            params.bottomMargin = 0
+            cell.layoutParams = params
+        }
+        requestLayout()
     }
 
     fun showUnits(units: List<String>, accentColor: Int) {
