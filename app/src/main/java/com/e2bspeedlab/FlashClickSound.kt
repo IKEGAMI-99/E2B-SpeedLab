@@ -1,8 +1,11 @@
 package com.e2bspeedlab
 
 import android.content.Context
+import android.content.SharedPreferences
 import android.media.AudioAttributes
 import android.media.SoundPool
+import android.os.Handler
+import android.os.Looper
 import java.io.File
 import java.io.FileOutputStream
 import kotlin.math.PI
@@ -21,7 +24,14 @@ internal class FlashClickSound(context: Context) : AutoCloseable {
 
     private enum class Kind { WORD, CLAUSE, SENTENCE }
 
+    companion object {
+        private const val PREFS_NAME = "speedlab"
+        private const val PREF_CLICK_ENABLED = "flash_click_enabled"
+    }
+
     private val appContext = context.applicationContext
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private val prefs = appContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
     private val loaded = HashSet<Int>()
     private val soundPool = SoundPool.Builder()
         .setMaxStreams(4)
@@ -40,6 +50,13 @@ internal class FlashClickSound(context: Context) : AutoCloseable {
 
     @Volatile
     private var released = false
+
+    private val preferenceListener = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
+        if (key == PREF_CLICK_ENABLED && prefs.getBoolean(PREF_CLICK_ENABLED, true)) {
+            // Give the UI write a moment to settle. This also makes CLICK ON an audible sanity test.
+            mainHandler.postDelayed({ playTest() }, 80L)
+        }
+    }
 
     init {
         // Version the cache directory so an in-place app update cannot keep the old 5 ms WAVs.
@@ -60,6 +77,7 @@ internal class FlashClickSound(context: Context) : AutoCloseable {
         wordId = soundPool.load(word.absolutePath, 1)
         clauseId = soundPool.load(clause.absolutePath, 1)
         sentenceId = soundPool.load(sentence.absolutePath, 1)
+        prefs.registerOnSharedPreferenceChangeListener(preferenceListener)
     }
 
     /** Plays the marker matching the punctuation at the end of [unit]. */
@@ -73,7 +91,7 @@ internal class FlashClickSound(context: Context) : AutoCloseable {
         play(kind)
     }
 
-    /** Loud word marker used by UI code when it wants an immediate audio sanity check. */
+    /** Loud word marker used when CLICK is switched on as an immediate audio sanity check. */
     fun playTest() {
         if (!released) play(Kind.WORD, test = true)
     }
@@ -107,6 +125,8 @@ internal class FlashClickSound(context: Context) : AutoCloseable {
     override fun close() {
         if (released) return
         released = true
+        mainHandler.removeCallbacksAndMessages(null)
+        prefs.unregisterOnSharedPreferenceChangeListener(preferenceListener)
         soundPool.release()
         synchronized(loaded) { loaded.clear() }
     }
