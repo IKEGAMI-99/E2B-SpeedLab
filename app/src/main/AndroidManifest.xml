@@ -38,6 +38,11 @@
 
         <activity
             android:name=".ReadActivity"
+            android:exported="false"
+            android:screenOrientation="portrait" />
+
+        <activity
+            android:name=".ReadActivityV2"
             android:exported="true"
             android:screenOrientation="portrait">
             <intent-filter>
