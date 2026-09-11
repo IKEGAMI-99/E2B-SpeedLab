@@ -10,8 +10,8 @@ android {
         applicationId = "com.e2bspeedlab"
         minSdk = 31
         targetSdk = 37
-        versionCode = 24
-        versionName = "0.3.8"
+        versionCode = 25
+        versionName = "0.3.9"
 
         ndk {
             abiFilters += "arm64-v8a"
