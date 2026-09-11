@@ -10,11 +10,12 @@ import kotlin.math.exp
 import kotlin.math.sin
 
 /**
- * Tiny preloaded sonification for FLASH frame boundaries.
+ * Reliable preloaded sonification for FLASH frame boundaries.
  *
- * The WAVs are synthesized once into cache and loaded into SoundPool. Playback therefore does no
- * file I/O on the FLASH timing path. Sentence/clause endings use slightly lower clicks so the ear
- * can follow structure without needing a second visual cue.
+ * v0.3.6 used USAGE_ASSISTANCE_SONIFICATION plus 5-8 ms samples. Some OEM Android builds, notably
+ * HyperOS, may mute that usage with system-effect settings or swallow such tiny buffers. This
+ * implementation routes through the media/game path, uses low-latency audio attributes, and keeps
+ * the click short but long enough to survive the device mixer.
  */
 internal class FlashClickSound(context: Context) : AutoCloseable {
 
@@ -26,8 +27,9 @@ internal class FlashClickSound(context: Context) : AutoCloseable {
         .setMaxStreams(4)
         .setAudioAttributes(
             AudioAttributes.Builder()
-                .setUsage(AudioAttributes.USAGE_ASSISTANCE_SONIFICATION)
+                .setUsage(AudioAttributes.USAGE_GAME)
                 .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                .setFlags(AudioAttributes.FLAG_LOW_LATENCY)
                 .build()
         )
         .build()
@@ -36,49 +38,75 @@ internal class FlashClickSound(context: Context) : AutoCloseable {
     private val clauseId: Int
     private val sentenceId: Int
 
+    @Volatile
+    private var released = false
+
     init {
-        val dir = File(appContext.cacheDir, "flash_clicks").apply { mkdirs() }
-        val word = File(dir, "word.wav").also {
-            if (!it.exists()) writeClickWav(it, frequencyHz = 2600.0, durationMs = 5.0, gain = 0.34)
+        // Version the cache directory so an in-place app update cannot keep the old 5 ms WAVs.
+        val dir = File(appContext.cacheDir, "flash_clicks_v2").apply { mkdirs() }
+        val word = File(dir, "word_v2.wav").also {
+            writeClickWav(it, frequencyHz = 2350.0, durationMs = 18.0, gain = 0.92)
         }
-        val clause = File(dir, "clause.wav").also {
-            if (!it.exists()) writeClickWav(it, frequencyHz = 1750.0, durationMs = 6.0, gain = 0.38)
+        val clause = File(dir, "clause_v2.wav").also {
+            writeClickWav(it, frequencyHz = 1550.0, durationMs = 21.0, gain = 0.95)
         }
-        val sentence = File(dir, "sentence.wav").also {
-            if (!it.exists()) writeClickWav(it, frequencyHz = 1050.0, durationMs = 8.0, gain = 0.45)
+        val sentence = File(dir, "sentence_v2.wav").also {
+            writeClickWav(it, frequencyHz = 980.0, durationMs = 25.0, gain = 0.98)
         }
 
         soundPool.setOnLoadCompleteListener { _, sampleId, status ->
-            if (status == 0) synchronized(loaded) { loaded += sampleId }
+            if (status == 0 && !released) synchronized(loaded) { loaded += sampleId }
         }
         wordId = soundPool.load(word.absolutePath, 1)
         clauseId = soundPool.load(clause.absolutePath, 1)
         sentenceId = soundPool.load(sentence.absolutePath, 1)
     }
 
+    /** Plays the marker matching the punctuation at the end of [unit]. */
     fun playFor(unit: String) {
+        if (released) return
         val kind = when (unit.trimEnd().lastOrNull()) {
             '。', '！', '？', '.', '!', '?' -> Kind.SENTENCE
             '、', ',', ';', ':', '；', '：' -> Kind.CLAUSE
             else -> Kind.WORD
         }
+        play(kind)
+    }
+
+    /** Loud word marker used by UI code when it wants an immediate audio sanity check. */
+    fun playTest() {
+        if (!released) play(Kind.WORD, test = true)
+    }
+
+    private fun play(kind: Kind, test: Boolean = false) {
         val id = when (kind) {
             Kind.WORD -> wordId
             Kind.CLAUSE -> clauseId
             Kind.SENTENCE -> sentenceId
         }
+        if (id <= 0) return
+
         val ready = synchronized(loaded) { id in loaded }
         if (!ready) return
 
-        val volume = when (kind) {
-            Kind.WORD -> 0.20f
-            Kind.CLAUSE -> 0.22f
-            Kind.SENTENCE -> 0.27f
+        val volume = if (test) {
+            0.95f
+        } else {
+            when (kind) {
+                Kind.WORD -> 0.62f
+                Kind.CLAUSE -> 0.70f
+                Kind.SENTENCE -> 0.78f
+            }
         }
+
+        // SoundPool is fully preloaded here. No filesystem or decoder work happens in the FLASH
+        // step(), which keeps 1000+ WPM timing isolated from audio I/O.
         soundPool.play(id, volume, volume, 1, 0, 1.0f)
     }
 
     override fun close() {
+        if (released) return
+        released = true
         soundPool.release()
         synchronized(loaded) { loaded.clear() }
     }
@@ -88,18 +116,31 @@ internal class FlashClickSound(context: Context) : AutoCloseable {
         val samples = (sampleRate * durationMs / 1000.0).toInt().coerceAtLeast(1)
         val pcm = ByteArray(samples * 2)
 
+        // A sharp bipolar impulse followed by a damped high-frequency body survives phone-speaker
+        // filtering much better than the almost-one-millisecond transient used previously.
+        var noiseState = 0x13579BDF
         for (i in 0 until samples) {
             val t = i.toDouble() / sampleRate
-            // Fast exponential decay gives a dry transient instead of a tiny musical note.
-            val envelope = exp(-t * 900.0)
-            val transient = if (i == 0) 0.45 else 0.0
-            val wave = (sin(2.0 * PI * frequencyHz * t) * envelope + transient) * gain
+            noiseState = noiseState xor (noiseState shl 13)
+            noiseState = noiseState xor (noiseState ushr 17)
+            noiseState = noiseState xor (noiseState shl 5)
+            val noise = ((noiseState and 0xFFFF) / 32767.5) - 1.0
+
+            val envelope = exp(-t * 170.0)
+            val body = sin(2.0 * PI * frequencyHz * t) * 0.70 + noise * 0.18
+            val impulse = when (i) {
+                0 -> 0.95
+                1 -> -0.72
+                2 -> 0.40
+                else -> 0.0
+            }
+            val wave = (impulse + body * envelope) * gain
             val value = (wave.coerceIn(-1.0, 1.0) * Short.MAX_VALUE).toInt().toShort()
             pcm[i * 2] = (value.toInt() and 0xFF).toByte()
             pcm[i * 2 + 1] = ((value.toInt() ushr 8) and 0xFF).toByte()
         }
 
-        FileOutputStream(file).use { out ->
+        FileOutputStream(file, false).use { out ->
             fun ascii(s: String) = out.write(s.toByteArray(Charsets.US_ASCII))
             fun le16(v: Int) {
                 out.write(v and 0xFF)
@@ -127,6 +168,7 @@ internal class FlashClickSound(context: Context) : AutoCloseable {
             ascii("data")
             le32(dataSize)
             out.write(pcm)
+            out.fd.sync()
         }
     }
 }
