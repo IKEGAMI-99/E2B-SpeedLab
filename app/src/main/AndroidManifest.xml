@@ -33,6 +33,11 @@
 
         <activity
             android:name=".PracticalActivity"
+            android:exported="false"
+            android:screenOrientation="portrait" />
+
+        <activity
+            android:name=".ReadActivity"
             android:exported="true"
             android:screenOrientation="portrait">
             <intent-filter>
