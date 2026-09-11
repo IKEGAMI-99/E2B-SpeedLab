@@ -25,7 +25,6 @@ import android.widget.ProgressBar
 import android.widget.SeekBar
 import android.widget.TextView
 import java.io.File
-import java.util.ArrayDeque
 import java.util.Locale
 import kotlin.math.ceil
 import kotlinx.coroutines.CoroutineScope
@@ -241,11 +240,11 @@ class AozoraBookActivityV2 : Activity() {
 
         scope.launch {
             try {
-                val text = withContext(Dispatchers.IO) { client.fetchBookText(book) }
+                val bookText = withContext(Dispatchers.IO) { client.fetchBookText(book) }
                 activeBook = book
-                rawBookText = text
-                require(text.isNotBlank()) { "No readable text" }
-                showBookOptions(book, text)
+                rawBookText = bookText
+                require(bookText.isNotBlank()) { "No readable text" }
+                showBookOptions(book, bookText)
             } catch (t: Throwable) {
                 loading.text = "DOWNLOAD ERROR\n${t.message ?: t.javaClass.simpleName}"
                 root.addView(Button(this@AozoraBookActivityV2).apply {
@@ -256,7 +255,7 @@ class AozoraBookActivityV2 : Activity() {
         }
     }
 
-    private fun showBookOptions(book: AozoraBook, text: String) {
+    private fun showBookOptions(book: AozoraBook, bookText: String) {
         screen = Screen.OPTIONS
         if (::reader.isInitialized) reader.stop()
         root.removeAllViews()
@@ -285,7 +284,7 @@ class AozoraBookActivityV2 : Activity() {
         root.addView(top)
 
         root.addView(TextView(this).apply {
-            text = "${String.format(Locale.US, "%,d", text.length)}字 • 読み方を選択"
+            text = "${String.format(Locale.US, "%,d", bookText.length)}字 • 読み方を選択"
             textSize = 12f
             setTextColor(Color.rgb(125, 226, 190))
             setPadding(0, dp(12), 0, dp(10))
@@ -294,7 +293,7 @@ class AozoraBookActivityV2 : Activity() {
         val original = optionButton("ORIGINAL\n原文をそのままFLASH") {
             currentVariantKey = "orig"
             currentVariantLabel = "ORIGINAL"
-            currentUnits = AozoraUnitizerV2.unitize(text)
+            currentUnits = AozoraUnitizerV2.unitize(bookText)
             require(currentUnits.isNotEmpty()) { "No readable text" }
             showReader(book)
         }
@@ -309,7 +308,7 @@ class AozoraBookActivityV2 : Activity() {
             }
             val cacheMark = if (cached) " • CACHED" else ""
             root.addView(
-                optionButton("AI $ratio%$cacheMark\n$subtitle") { startCompression(book, text, ratio) },
+                optionButton("AI $ratio%$cacheMark\n$subtitle") { startCompression(book, bookText, ratio) },
                 LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(72)).apply { bottomMargin = dp(8) },
             )
         }
@@ -410,19 +409,19 @@ class AozoraBookActivityV2 : Activity() {
         }
     }
 
-    private fun showTemporaryError(book: AozoraBook, text: String, message: String) {
+    private fun showTemporaryError(book: AozoraBook, bookText: String, message: String) {
         screen = Screen.OPTIONS
         root.removeAllViews()
         root.addView(TextView(this).apply {
-            this.text = message
+            text = message
             gravity = Gravity.CENTER
             textSize = 18f
             setTextColor(Color.rgb(255, 190, 90))
         }, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
         root.addView(Button(this).apply {
-            this.text = "BACK"
+            text = "BACK"
             isAllCaps = false
-            setOnClickListener { showBookOptions(book, text) }
+            setOnClickListener { showBookOptions(book, bookText) }
         }, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(52)))
     }
 
@@ -624,9 +623,7 @@ class AozoraBookActivityV2 : Activity() {
                 activeBook?.let { showBookOptions(it, rawBookText) } ?: showSearch()
             }
             Screen.OPTIONS -> showSearch()
-            Screen.COMPRESSING -> {
-                compressionJob?.cancel()
-            }
+            Screen.COMPRESSING -> compressionJob?.cancel()
             Screen.SEARCH -> super.onBackPressed()
         }
     }
